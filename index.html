@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Dienstübergabe Dispo/Besno – lokal (V7.59 Krankmeldung Mehrtage)</title>
+  <title>Dienstübergabe Dispo/Besno – lokal (V7.60 SharePoint-Übergabe)</title>
   <style>
     body{font-family:Arial,sans-serif;background:#f5f5f5;padding:24px}
     .form{max-width:1250px;margin:auto;background:#fff;padding:28px;border-radius:6px}
@@ -26,6 +26,10 @@
     textarea{resize:vertical}
     .field{background:#f9f9f9;padding:12px;border-radius:8px}
     .hint{font-size:12px;color:#666;margin-top:6px}
+    .cloudStatus{font-size:12px;color:#555;margin-top:8px;line-height:1.35}
+    .cloudStatus.ok{color:#134d24;font-weight:800}
+    .cloudStatus.warn{color:#5f4200;font-weight:800}
+    .cloudStatus.err{color:#b00020;font-weight:800}
     .hr{height:1px;background:#e6e6e6;margin:14px 0}
     .is-hidden{display:none}
 
@@ -596,7 +600,7 @@
 <div class="main-layout">
 <div class="form">
   <div class="topbar">
-    <h1>Dienstübergabe Dispo/Besno – lokal (V7.59 Krankmeldung Mehrtage)</h1>
+    <h1>Dienstübergabe Dispo/Besno – lokal (V7.60 SharePoint-Übergabe)</h1>
     <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
       <select id="roleSel" style="width:auto">
         <option value="Dispo">Dispo</option>
@@ -609,6 +613,7 @@
       </select>
       <button type="button" class="btn-primary" id="btnNewTask">+ Neuer Vorgang</button>
       <button type="button" class="btn-secondary" id="btnExport">Export JSON</button>
+      <button type="button" class="btn-blue" id="btnLoadLatestCloud">Letzte aus SharePoint laden</button>
       <label class="btn-secondary" style="display:inline-flex;align-items:center;gap:8px">
         Import JSON <input type="file" id="importFile" accept=".json,application/json" style="display:none">
       </label>
@@ -821,7 +826,9 @@
       <div style="font-weight:900;margin-bottom:6px;">Übergabe speichern</div>
       <button type="button" class="btn-primary" id="btnSaveHandover">Übergabe speichern</button>
       <button type="button" class="btn-secondary" id="btnShiftReport">Schichtrapport anzeigen / PDF</button>
-      <div class="hint">Testphase: öffnet eine druckbare Ansicht. Im Druckdialog kann „Als PDF speichern“ gewählt werden.</div>
+      <button type="button" class="btn-blue" id="btnLoadLatestCloud2">Letzte aus SharePoint laden</button>
+      <div class="hint">Speichern erfolgt lokal und – sobald die Flow-URLs eingetragen sind – zusätzlich in SharePoint.</div>
+      <div class="cloudStatus" id="cloudStatus">SharePoint-Speicher noch nicht konfiguriert.</div>
     </div>
     <div class="field">
       <div style="font-weight:900;margin-bottom:6px;">Letzte Übergaben</div>
@@ -930,6 +937,13 @@
 
   // ===== Konfiguration =====
   const LS_KEY = "mev_dienstuebergabe_local_v6_1";
+
+  // ===== V7.60 SharePoint / Power Automate =====
+  // Hier die beiden HTTP-POST-URLs aus Power Automate eintragen.
+  // Wichtig: URLs nicht in öffentliche Repos committen, wenn sie geheim bleiben sollen.
+  const SAVE_FLOW_URL = "https://defaulte3d2e8defe3548eaa78972c4a2acf9.8e.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/65bc7671fea74239aac0591a56f69d81/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=lFqDM4fusltfTyo-g0czYt8Yhl95IMlQWkim3fK3ZWk";
+  const LOAD_FLOW_URL = "https://defaulte3d2e8defe3548eaa78972c4a2acf9.8e.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/6160c1c3992a484f8da2bcd91b6183fe/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=a7Nb6s9h350_P2aVzkXv8T8d-KcIuZyBYxX3vXlkOyA";
+  const CLOUD_ENABLED = !SAVE_FLOW_URL.includes("HIER_DEINE") && !LOAD_FLOW_URL.includes("HIER_DEINE");
 
   const TYPEN = [
     { key:"anfrage_kunde", label:"Anfrage Kunde", title:"Anfrage Kunde – Rückmeldung ausstehend" },
@@ -1046,6 +1060,9 @@
   const operatorHint = $("operatorHint");
   const btnNewTask = $("btnNewTask");
   const btnExport = $("btnExport");
+  const btnLoadLatestCloud = $("btnLoadLatestCloud");
+  const btnLoadLatestCloud2 = $("btnLoadLatestCloud2");
+  const cloudStatus = $("cloudStatus");
   const importFile = $("importFile");
   const btnReset = $("btnReset");
   const q = $("q");
@@ -3480,7 +3497,90 @@
   return lines.join("\n");
 }
 
-  btnSaveHandover.addEventListener("click", ()=>{
+  function buildCloudPayload(latestHandover){
+    return {
+      appVersion: "7.60",
+      savedAt: nowIso(),
+      savedBy: operatorDisplayText() || (roleSel?.value || ""),
+      role: roleSel?.value || "Dispo",
+      shift: state.ui?.shift || "Früh",
+      latestHandover: latestHandover || null,
+      state: state
+    };
+  }
+
+  function setCloudStatus(text, kind=""){
+    if(!cloudStatus) return;
+    cloudStatus.textContent = text || "";
+    cloudStatus.classList.remove("ok","warn","err");
+    if(kind) cloudStatus.classList.add(kind);
+  }
+
+  async function saveHandoverToSharePoint(entry){
+    if(!SAVE_FLOW_URL || SAVE_FLOW_URL.includes("HIER_DEINE")){
+      setCloudStatus("Lokal gespeichert. SharePoint-Speichern ist noch nicht konfiguriert: SAVE_FLOW_URL fehlt.", "warn");
+      return { skipped:true };
+    }
+
+    const payload = buildCloudPayload(entry);
+    const response = await fetch(SAVE_FLOW_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        aktion: "save",
+        gespeichertVon: payload.savedBy || "Dienstübergabe",
+        version: payload.appVersion,
+        daten: payload
+      })
+    });
+
+    let result = null;
+    try{ result = await response.json(); }catch(_){ result = { success: response.ok }; }
+    if(!response.ok || result?.success === false){
+      throw new Error(result?.message || `Power Automate Antwort: HTTP ${response.status}`);
+    }
+    setCloudStatus(`Lokal und in SharePoint gespeichert: ${fmtTs(entry.createdAt)}`, "ok");
+    return result;
+  }
+
+  async function loadLatestFromSharePoint(){
+    if(!LOAD_FLOW_URL || LOAD_FLOW_URL.includes("HIER_DEINE")){
+      alert("LOAD_FLOW_URL ist noch nicht eingetragen. Bitte zuerst den Laden-Flow erstellen und die URL im HTML eintragen.");
+      setCloudStatus("SharePoint-Laden ist noch nicht konfiguriert: LOAD_FLOW_URL fehlt.", "warn");
+      return;
+    }
+    if(!confirm("Letzte Übergabe aus SharePoint laden? Der lokale Stand in diesem Browser wird dadurch ersetzt.")) return;
+
+    setCloudStatus("Lade letzte Übergabe aus SharePoint …", "warn");
+    const response = await fetch(LOAD_FLOW_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ aktion: "loadLatest" })
+    });
+
+    const result = await response.json();
+    if(!response.ok || result?.success === false){
+      throw new Error(result?.message || `Power Automate Antwort: HTTP ${response.status}`);
+    }
+
+    let daten = result.daten;
+    if(typeof daten === "string") daten = JSON.parse(daten);
+    const remoteState = daten?.state || daten;
+
+    if(!remoteState || !Array.isArray(remoteState.tasks) || !Array.isArray(remoteState.handovers)){
+      throw new Error("Die geladene SharePoint-Antwort enthält keinen gültigen Dienstübergabe-Stand.");
+    }
+
+    remoteState.ui ||= state.ui || { shift:"Früh", evu:"__ALL__", listFilter:"aktiv" };
+    state = remoteState;
+    saveState();
+    if(handoverSummary) handoverSummary.value = state.handovers?.[0]?.summary || "";
+    if(handoverNotes) handoverNotes.value = state.handovers?.[0]?.notes || "";
+    safeRender();
+    setCloudStatus(`Letzte Übergabe aus SharePoint geladen${result.gespeichertAm ? ": " + fmtTs(result.gespeichertAm) : ""}.`, "ok");
+  }
+
+  btnSaveHandover.addEventListener("click", async ()=>{
     if(!handoverSummary.value.trim()){
       handoverSummary.value = buildAutoSummary(state.tasks||[]);
     }
@@ -3496,8 +3596,24 @@
     state.handovers.unshift(entry);
     saveState();
     renderHandovers();
-    alert("Übergabe gespeichert.");
+
+    try{
+      await saveHandoverToSharePoint(entry);
+      alert(SAVE_FLOW_URL.includes("HIER_DEINE") ? "Übergabe lokal gespeichert. SharePoint-URL fehlt noch." : "Übergabe lokal und in SharePoint gespeichert.");
+    }catch(err){
+      setCloudStatus("Lokal gespeichert, aber SharePoint-Speichern fehlgeschlagen: " + (err?.message || err), "err");
+      alert("Übergabe lokal gespeichert, aber SharePoint-Speichern fehlgeschlagen: " + (err?.message || err));
+    }
   });
+
+  btnLoadLatestCloud?.addEventListener("click", ()=>loadLatestFromSharePoint().catch(err=>{
+    setCloudStatus("SharePoint-Laden fehlgeschlagen: " + (err?.message || err), "err");
+    alert("SharePoint-Laden fehlgeschlagen: " + (err?.message || err));
+  }));
+  btnLoadLatestCloud2?.addEventListener("click", ()=>loadLatestFromSharePoint().catch(err=>{
+    setCloudStatus("SharePoint-Laden fehlgeschlagen: " + (err?.message || err), "err");
+    alert("SharePoint-Laden fehlgeschlagen: " + (err?.message || err));
+  }));
 
 
 
