@@ -600,7 +600,7 @@
 <div class="main-layout">
 <div class="form">
   <div class="topbar">
-    <h1>Dienstübergabe Dispo/Besno – lokal (V7.60 SharePoint-Übergabe)</h1>
+    <h1>Dienstübergabe Dispo/Besno</h1>
     <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
       <select id="roleSel" style="width:auto">
         <option value="Dispo">Dispo</option>
@@ -3572,6 +3572,8 @@
     }
 
     remoteState.ui ||= state.ui || { shift:"Früh", evu:"__ALL__", listFilter:"aktiv" };
+    remoteState.ui.listFilter = "aktiv";
+    remoteState.ui.evu = "__ALL__";
     state = remoteState;
     saveState();
     if(handoverSummary) handoverSummary.value = state.handovers?.[0]?.summary || "";
