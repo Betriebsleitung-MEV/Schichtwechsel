@@ -2718,24 +2718,51 @@
     }
 
     function createReplacementTaskFromSickDuty(p){
-      const serviceTask = createTaskFromPlanPerson(p, "ersatz");
-      serviceTask.__isNew = false;
-      serviceTask.id = uid();
-      serviceTask.createdAt = nowIso();
-      serviceTask.updatedAt = nowIso();
-      serviceTask.typ = "dienstaenderung";
-      serviceTask.typLabel = "Dienständerung";
-      serviceTask.titel = `Ersatzplanung Krankmeldung – ${p.name}${displayAuftrag(p) ? " – " + displayAuftrag(p) : ""}`;
-      serviceTask.notiz = `Aus Krankmeldung erstellt. Zeitraum: ${mKrankVon?.value || "—"} bis ${mKrankBis?.value || "—"}.`;
-      serviceTask.details ||= {};
-      serviceTask.details.changeSubtype = "ersatz";
-      serviceTask.details.changeTrigger = "krankmeldung";
-      serviceTask.details.changeReplacement = "ja";
-      serviceTask.details.krankVon = mKrankVon?.value || "";
-      serviceTask.details.krankBis = mKrankBis?.value || "";
-      serviceTask.details.parentKrankId = t.id;
-      return serviceTask;
-    }
+    const dienst = displayAuftrag(p) || p.auftrag || "";
+    const datum = planDateKey(p.start);
+    const zeit = fmtTimeRange(p);
+    const ort = p.ort || "";
+    const key = sickDutyKey(p);
+
+    const serviceTask = createTaskFromPlanPerson(p, "ersatz");
+    serviceTask.__isNew = false;
+    serviceTask.id = uid();
+    serviceTask.createdAt = nowIso();
+    serviceTask.updatedAt = nowIso();
+
+    serviceTask.typ = "dienstaenderung";
+    serviceTask.typLabel = "Dienständerung";
+    serviceTask.shift = state.ui.shift || "Tag";
+    serviceTask.kundeEvuId = "";
+    serviceTask.kundeLabel = "";
+
+    serviceTask.titel = `Ersatzplanung Krankmeldung – ${p.name}${dienst ? " – " + dienst : ""}`;
+    serviceTask.zug = dienst;
+    serviceTask.dienst = dienst;
+    serviceTask.ort = ort;
+    serviceTask.notiz = `Aus Krankmeldung erstellt. Zeitraum: ${mKrankVon?.value || "—"} bis ${mKrankBis?.value || "—"}.`;
+
+    serviceTask.details ||= {};
+    serviceTask.details.mitarbeiterName = p.name || "";
+    serviceTask.details.dienst = dienst;
+    serviceTask.details.datum = datum;
+    serviceTask.details.zeit = zeit;
+    serviceTask.details.vonNach = ort;
+    serviceTask.details.bisherigePlanung = [dienst, datum, zeit, ort].filter(Boolean).join(" · ");
+    serviceTask.details.changeOldDienst = [dienst, datum, zeit, ort].filter(Boolean).join(" · ");
+    serviceTask.details.changeSubtype = "ersatz";
+    serviceTask.details.changeTrigger = "krankmeldung";
+    serviceTask.details.changeReplacement = "ja";
+    serviceTask.details.changeDecision = "offen";
+    serviceTask.details.krankVon = mKrankVon?.value || "";
+    serviceTask.details.krankBis = mKrankBis?.value || "";
+    serviceTask.details.parentKrankId = t.id;
+    serviceTask.details.parentKrankDutyKey = key;
+    serviceTask.details.parentKrankDutyStart = p.start?.toISOString?.() || "";
+    serviceTask.details.parentKrankDutyEnd = p.end?.toISOString?.() || "";
+
+    return serviceTask;
+   }
 
     function startReplacementForSickDuty(key){
       const duty = findSickDutiesForCurrentEmployee().find(p=>sickDutyKey(p) === key);
