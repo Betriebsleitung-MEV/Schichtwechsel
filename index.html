@@ -2250,7 +2250,9 @@
       `<option value="${escapeHtml(e.id)}" ${t.kundeEvuId===e.id?"selected":""}>${escapeHtml(e.label)} (${escapeHtml(e.id)})</option>`
     ).join("");
 
-    const typOptions = TYPEN.map(x=>`<option value="${x.key}" ${t.typ===x.key?"selected":""}>${escapeHtml(x.label)}</option>`).join("");
+    const typOptions = TYPEN
+      .filter(x => x.key !== "neuer_ma_geplant" || t.typ === "neuer_ma_geplant")
+      .map(x=>`<option value="${x.key}" ${t.typ===x.key?"selected":""}>${escapeHtml(x.label)}</option>`).join("");
 
     box.innerHTML = `
       <div class="modalHeader" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
@@ -3077,30 +3079,35 @@
     serviceTask.createdAt = nowIso();
     serviceTask.updatedAt = nowIso();
 
-    serviceTask.typ = "dienstaenderung";
-    serviceTask.typLabel = "Dienständerung";
+    serviceTask.typ = "neuer_ma_geplant";
+    serviceTask.typLabel = "Ersatzplanung / neuer MA geplant";
     serviceTask.shift = state.ui.shift || "Tag";
     serviceTask.kundeEvuId = "";
     serviceTask.kundeLabel = "";
 
-    serviceTask.titel = `Ersatzplanung Krankmeldung – ${p.name}${dienst ? " – " + dienst : ""}`;
+    serviceTask.titel = `Ersatzplanung – ${dienst || "Dienst"}${datum ? " – " + datum : ""}`;
     serviceTask.zug = dienst;
     serviceTask.dienst = dienst;
     serviceTask.ort = ort;
-    serviceTask.notiz = `Aus Krankmeldung erstellt. Zeitraum: ${mKrankVon?.value || "—"} bis ${mKrankBis?.value || "—"}.`;
+    serviceTask.notiz = `Aus Krankmeldung erstellt. Betroffener Mitarbeiter: ${p.name || "—"}. Zeitraum: ${mKrankVon?.value || "—"} bis ${mKrankBis?.value || "—"}.`;
 
     serviceTask.details ||= {};
-    serviceTask.details.mitarbeiterName = p.name || "";
+    serviceTask.details.sourceProcess = "krankmeldung_ersatzplanung";
+    serviceTask.details.customerMode = "newstaff";
+    serviceTask.details.affectedMitarbeiterName = p.name || "";
+    serviceTask.details.mitarbeiterName = "";
     serviceTask.details.dienst = dienst;
     serviceTask.details.datum = datum;
     serviceTask.details.zeit = zeit;
     serviceTask.details.vonNach = ort;
     serviceTask.details.bisherigePlanung = [dienst, datum, zeit, ort].filter(Boolean).join(" · ");
     serviceTask.details.changeOldDienst = [dienst, datum, zeit, ort].filter(Boolean).join(" · ");
-    serviceTask.details.changeSubtype = "ersatz";
+    serviceTask.details.changeSubtype = "ersatzplanung";
     serviceTask.details.changeTrigger = "krankmeldung";
     serviceTask.details.changeReplacement = "ja";
     serviceTask.details.changeDecision = "offen";
+    serviceTask.details.ersatzStatus = "offen";
+    serviceTask.details.replacementForText = `${p.name || "betroffener Mitarbeiter"}${dienst ? " · " + dienst : ""}${datum ? " · " + datum : ""}`;
     serviceTask.details.krankVon = mKrankVon?.value || "";
     serviceTask.details.krankBis = mKrankBis?.value || "";
     serviceTask.details.parentKrankId = t.id;
@@ -3114,6 +3121,12 @@
     function startReplacementForSickDuty(key){
       const duty = findSickDutiesForCurrentEmployee().find(p=>sickDutyKey(p) === key);
       if(!duty) return;
+      const existingLink = (t.details?.krankReplacementTasks || []).find(x=>x.dutyKey===key);
+      const existingTask = existingLink ? (state.tasks || []).find(x=>x.id===existingLink.taskId) : null;
+      if(existingTask){
+        openTaskModal(existingTask);
+        return;
+      }
       applyToTask();
       if(!t.titel) t.titel = `Krankmeldung – ${t.details?.mitarbeiterName || "Mitarbeiter"}`;
       if(isNew && !state.tasks.some(x=>x.id===t.id)) state.tasks.unshift(t);
@@ -5696,6 +5709,38 @@ async function v742AutoloadLocalFiles(){
   dbg("Bereit. Autoload wird gestartet.");
   setTimeout(v742AutoloadLocalFiles, 50);
 })();
+
+
+/* ===== V7.62 Ersatzplanung auch bei Krankmeldung als verknüpfter Folgeprozess ===== */
+v761IsReplacementTask = function(t){
+  if(!t) return false;
+  const d = t.details || {};
+  if(t.typ === "ersatzplanung") return true;
+  if(t.typ !== "neuer_ma_geplant") return false;
+  return !!(
+    d.sourceProcess === "dienstwechsel_ersatzplanung" ||
+    d.sourceProcess === "krankmeldung_ersatzplanung" ||
+    d.parentChangeId ||
+    d.parentKrankId ||
+    d.sourceTaskId ||
+    d.parentInternalVorgangId ||
+    d.changeSubtype === "ersatzplanung"
+  );
+};
+
+// Gruppierung erneut setzen, damit echte Ersatzplanungen aus Dienständerung und Krankmeldung getrennt angezeigt werden.
+v724TaskTypeGroup = function(t){
+  if(t.statusGesamt === OVERALL.eskalation) return "00|Eskalation / Konflikte";
+  if(t.typ === "haz" || t.details?.changeSubtype === "haz") return "10|HAZ";
+  if(t.typ === "anfrage_kunde") return "20|Kundenanfragen";
+  if(v761IsReplacementTask(t)) return "25|Ersatzplanung / neuer Mitarbeiter geplant";
+  if(t.typ === "krankmeldung") return "30|Krankmeldungen";
+  if(t.typ === "dienstaenderung") return "40|Dienständerungen";
+  if(t.typ === "ereignis_kunde" || t.typ === "ereignis") return "50|Ereignisse";
+  if(t.typ === "notiz") return "60|Notizen";
+  return "90|Sonstige Vorgänge";
+};
+
 </script>
 
 <script>
@@ -5736,6 +5781,38 @@ async function v742AutoloadLocalFiles(){
   setTimeout(cleanSidePanelV34, 500);
   setInterval(cleanSidePanelV34, 1500);
 })();
+
+
+/* ===== V7.62 Ersatzplanung auch bei Krankmeldung als verknüpfter Folgeprozess ===== */
+v761IsReplacementTask = function(t){
+  if(!t) return false;
+  const d = t.details || {};
+  if(t.typ === "ersatzplanung") return true;
+  if(t.typ !== "neuer_ma_geplant") return false;
+  return !!(
+    d.sourceProcess === "dienstwechsel_ersatzplanung" ||
+    d.sourceProcess === "krankmeldung_ersatzplanung" ||
+    d.parentChangeId ||
+    d.parentKrankId ||
+    d.sourceTaskId ||
+    d.parentInternalVorgangId ||
+    d.changeSubtype === "ersatzplanung"
+  );
+};
+
+// Gruppierung erneut setzen, damit echte Ersatzplanungen aus Dienständerung und Krankmeldung getrennt angezeigt werden.
+v724TaskTypeGroup = function(t){
+  if(t.statusGesamt === OVERALL.eskalation) return "00|Eskalation / Konflikte";
+  if(t.typ === "haz" || t.details?.changeSubtype === "haz") return "10|HAZ";
+  if(t.typ === "anfrage_kunde") return "20|Kundenanfragen";
+  if(v761IsReplacementTask(t)) return "25|Ersatzplanung / neuer Mitarbeiter geplant";
+  if(t.typ === "krankmeldung") return "30|Krankmeldungen";
+  if(t.typ === "dienstaenderung") return "40|Dienständerungen";
+  if(t.typ === "ereignis_kunde" || t.typ === "ereignis") return "50|Ereignisse";
+  if(t.typ === "notiz") return "60|Notizen";
+  return "90|Sonstige Vorgänge";
+};
+
 </script>
 
 
@@ -5824,6 +5901,38 @@ async function v742AutoloadLocalFiles(){
   setTimeout(apply35, 500);
   setInterval(apply35, 1500);
 })();
+
+
+/* ===== V7.62 Ersatzplanung auch bei Krankmeldung als verknüpfter Folgeprozess ===== */
+v761IsReplacementTask = function(t){
+  if(!t) return false;
+  const d = t.details || {};
+  if(t.typ === "ersatzplanung") return true;
+  if(t.typ !== "neuer_ma_geplant") return false;
+  return !!(
+    d.sourceProcess === "dienstwechsel_ersatzplanung" ||
+    d.sourceProcess === "krankmeldung_ersatzplanung" ||
+    d.parentChangeId ||
+    d.parentKrankId ||
+    d.sourceTaskId ||
+    d.parentInternalVorgangId ||
+    d.changeSubtype === "ersatzplanung"
+  );
+};
+
+// Gruppierung erneut setzen, damit echte Ersatzplanungen aus Dienständerung und Krankmeldung getrennt angezeigt werden.
+v724TaskTypeGroup = function(t){
+  if(t.statusGesamt === OVERALL.eskalation) return "00|Eskalation / Konflikte";
+  if(t.typ === "haz" || t.details?.changeSubtype === "haz") return "10|HAZ";
+  if(t.typ === "anfrage_kunde") return "20|Kundenanfragen";
+  if(v761IsReplacementTask(t)) return "25|Ersatzplanung / neuer Mitarbeiter geplant";
+  if(t.typ === "krankmeldung") return "30|Krankmeldungen";
+  if(t.typ === "dienstaenderung") return "40|Dienständerungen";
+  if(t.typ === "ereignis_kunde" || t.typ === "ereignis") return "50|Ereignisse";
+  if(t.typ === "notiz") return "60|Notizen";
+  return "90|Sonstige Vorgänge";
+};
+
 </script>
 
 
@@ -5975,6 +6084,38 @@ async function v742AutoloadLocalFiles(){
     try{ window.openReplyModal = patchedReply; openReplyModal = patchedReply; }catch(e){}
   }
 })();
+
+
+/* ===== V7.62 Ersatzplanung auch bei Krankmeldung als verknüpfter Folgeprozess ===== */
+v761IsReplacementTask = function(t){
+  if(!t) return false;
+  const d = t.details || {};
+  if(t.typ === "ersatzplanung") return true;
+  if(t.typ !== "neuer_ma_geplant") return false;
+  return !!(
+    d.sourceProcess === "dienstwechsel_ersatzplanung" ||
+    d.sourceProcess === "krankmeldung_ersatzplanung" ||
+    d.parentChangeId ||
+    d.parentKrankId ||
+    d.sourceTaskId ||
+    d.parentInternalVorgangId ||
+    d.changeSubtype === "ersatzplanung"
+  );
+};
+
+// Gruppierung erneut setzen, damit echte Ersatzplanungen aus Dienständerung und Krankmeldung getrennt angezeigt werden.
+v724TaskTypeGroup = function(t){
+  if(t.statusGesamt === OVERALL.eskalation) return "00|Eskalation / Konflikte";
+  if(t.typ === "haz" || t.details?.changeSubtype === "haz") return "10|HAZ";
+  if(t.typ === "anfrage_kunde") return "20|Kundenanfragen";
+  if(v761IsReplacementTask(t)) return "25|Ersatzplanung / neuer Mitarbeiter geplant";
+  if(t.typ === "krankmeldung") return "30|Krankmeldungen";
+  if(t.typ === "dienstaenderung") return "40|Dienständerungen";
+  if(t.typ === "ereignis_kunde" || t.typ === "ereignis") return "50|Ereignisse";
+  if(t.typ === "notiz") return "60|Notizen";
+  return "90|Sonstige Vorgänge";
+};
+
 </script>
 
 
@@ -6386,9 +6527,264 @@ async function v742AutoloadLocalFiles(){
     });
     mo.observe(document.body,{childList:true,subtree:true});
   }
+
+/* ===== V7.61 Dienständerung: Ersatzplanung als verknüpfter Folgeprozess ===== */
+function v761IsReplacementTask(t){
+  return !!(t && (t.typ === "neuer_ma_geplant" || t.typ === "ersatzplanung" || t.details?.sourceProcess === "dienstwechsel_ersatzplanung"));
+}
+
+function v761FindReplacementForChange(task){
+  if(!task) return null;
+  const d = task.details || {};
+  return (state.tasks || []).find(x =>
+    x && !x.archived && (
+      (d.replacementTaskId && x.id === d.replacementTaskId) ||
+      x.details?.parentChangeId === task.id ||
+      x.details?.sourceTaskId === task.id
+    )
+  ) || null;
+}
+
+function v761OriginalDienstText(d, task){
+  return [
+    d.changeOldDienst || d.bisherigePlanung || d.dienst || task?.dienst || task?.zug || "",
+    d.datum || "",
+    d.zeit || "",
+    d.vonNach || task?.ort || ""
+  ].filter(Boolean).join(" · ");
+}
+
+// Ersatzplanung nicht mehr als zweite normale Dienständerung mit gleichem MA erzeugen,
+// sondern als verknüpften Folgeprozess. Dort wird später der Ersatz-Mitarbeiter gewählt.
+createReplacementFromChange = function(task){
+  if(!task) return;
+  task.details ||= {};
+  const d = task.details;
+
+  const existing = v761FindReplacementForChange(task);
+  if(existing){
+    d.changeReplacement = "ja";
+    d.replacementTaskId = existing.id;
+    d.replacementStatus = existing.done ? "abgeschlossen" : "offen";
+    task.updatedAt = nowIso();
+    saveState();
+    safeRender();
+    openTaskModal(existing);
+    return;
+  }
+
+  const affectedName = d.mitarbeiterName || d.eventMitarbeiterName || "";
+  const dienst = d.dienst || task.dienst || task.zug || "";
+  const datum = d.datum || (task.createdAt || "").slice(0,10) || (planDateSide?.value || "");
+  const relation = d.vonNach || task.ort || "";
+  const oldText = v761OriginalDienstText(d, task);
+
+  const repl = ensureInternalVorgangId({
+    id: uid(),
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    shift: task.shift || state.ui.shift || "Tag",
+    kundeEvuId: task.kundeEvuId || "",
+    kundeLabel: task.kundeLabel || "",
+    typ: "neuer_ma_geplant",
+    typLabel: "Ersatzplanung / neuer MA geplant",
+    titel: `Ersatzplanung – ${dienst || "Dienst"}${datum ? " – " + datum : ""}`,
+    zug: dienst || task.zug || "",
+    dienst: dienst,
+    ort: relation,
+    incidentId: "",
+    notiz: `Aus Dienständerung erstellt.${affectedName ? " Betroffener Mitarbeiter: " + affectedName + "." : ""}${task.notiz ? "\n" + task.notiz : ""}`,
+    requests: [],
+    details: {
+      customerMode: "newstaff",
+      sourceProcess: "dienstwechsel_ersatzplanung",
+      sourceTaskId: task.id,
+      parentChangeId: task.id,
+      parentInternalVorgangId: task.internalVorgangId || "",
+      affectedMitarbeiterName: affectedName,
+      affectedMitarbeiterMail: d.mitarbeiterMail || "",
+      affectedMitarbeiterTel: d.mitarbeiterTel || "",
+      dienst: dienst,
+      datum: datum,
+      zeit: d.zeit || "",
+      vonNach: relation,
+      bisherigePlanung: oldText,
+      changeSubtype: "ersatzplanung",
+      changeTrigger: "dienstwechsel",
+      changeReplacement: "ja",
+      changeOldDienst: oldText,
+      changeNewDienst: "",
+      changeDecision: "offen",
+      ersatzStatus: "offen",
+      replacementForText: `${affectedName || "betroffener Mitarbeiter"}${dienst ? " · " + dienst : ""}${datum ? " · " + datum : ""}`
+    },
+    done:false,
+    archived:false
+  });
+
+  d.changeReplacement = "ja";
+  d.replacementStatus = "offen";
+  d.replacementTaskId = repl.id;
+  d.replacementInternalVorgangId = repl.internalVorgangId || "";
+  d.replacementForText = repl.details.replacementForText;
+  task.updatedAt = nowIso();
+  v724AddHistory?.(task, "Ersatzplanung als Folgeprozess gestartet", "replacement");
+  v724AddHistory?.(repl, "Aus Dienständerung verknüpft erstellt", "replacement");
+
+  state.tasks.unshift(repl);
+  saveState();
+  safeRender();
+  openTaskModal(repl);
+};
+
+// Gruppierung: interner Folgeprozess nicht mehr unter Kundenanfragen anzeigen.
+v724TaskTypeGroup = function(t){
+  if(t.statusGesamt === OVERALL.eskalation) return "00|Eskalation / Konflikte";
+  if(t.typ === "haz" || t.details?.changeSubtype === "haz") return "10|HAZ";
+  if(v761IsReplacementTask(t)) return "25|Ersatzplanung / neuer Mitarbeiter geplant";
+  if(t.typ === "anfrage_kunde") return "20|Kundenanfragen";
+  if(t.typ === "krankmeldung") return "30|Krankmeldungen";
+  if(t.typ === "dienstaenderung") return "40|Dienständerungen";
+  if(t.typ === "ereignis_kunde" || t.typ === "ereignis") return "50|Ereignisse";
+  if(t.typ === "notiz") return "60|Notizen";
+  return "90|Sonstige Vorgänge";
+};
+
+const v761OldTaskGroupClass = v724TaskGroupClass;
+v724TaskGroupClass = function(label){
+  if(label.includes("Ersatzplanung")) return "";
+  return v761OldTaskGroupClass ? v761OldTaskGroupClass(label) : "";
+};
+
+// Kartenknöpfe für Ersatzplanung: keine Kundenentscheidung, sondern MA auswählen / Mailstatus.
+buildTaskActionsHtml = function(t, status){
+  const id = escapeHtml(t.id);
+  const typ = t.typ || "";
+  const isDone = !!t.done;
+  const isHaz = typ === "haz" || t.details?.changeSubtype === "haz";
+  const isChange = typ === "dienstaenderung";
+  const isCustomer = typ === "anfrage_kunde";
+  const isReplacement = v761IsReplacementTask(t);
+  const isEventFollowUp = typ === "ereignis_aufgabe";
+
+  const parts = [];
+  parts.push(`<button class="btn-primary" data-act="edit" data-id="${id}">${isDone ? "Öffnen / ansehen" : "Öffnen / bearbeiten"}</button>`);
+
+  if(!isDone){
+    if(isCustomer){
+      parts.push(`<button class="btn-blue" data-act="reply" data-id="${id}">Antwort / Kundenentscheid</button>`);
+    }else if(isReplacement){
+      parts.push(`<button class="btn-blue" data-act="edit" data-id="${id}">Ersatz-MA wählen / Mail</button>`);
+    }else if(isChange){
+      parts.push(`<button class="btn-blue" data-act="reply" data-id="${id}">Antwortmail vorbereiten</button>`);
+      parts.push(`<button class="btn-secondary" data-act="ask" data-id="${id}">Ersatzplanung starten</button>`);
+    }else if(isHaz){
+      parts.push(`<button class="btn-blue" data-act="reply" data-id="${id}">Fallaufnahme-Mail vorbereiten</button>`);
+    }else if(isEventFollowUp){
+      parts.push(`<button class="btn-secondary" data-act="eventDone" data-id="${id}">Aufgabe erledigt</button>`);
+    }
+    parts.push(`<button class="btn-secondary" data-act="done" data-id="${id}">Abschliessen</button>`);
+  }else{
+    parts.push(`<button class="btn-secondary" data-act="reopen" data-id="${id}">Wiedereröffnen</button>`);
+    parts.push(`<details class="taskMore"><summary>Weitere Aktionen</summary><div class="taskMoreInner"><button class="btn-danger" data-act="del" data-id="${id}">Archivieren</button></div></details>`);
+  }
+
+  return parts.join("\n");
+};
+
+// Verlauf für Dienständerung zeigt angebundene Ersatzplanung; Ersatzplanung zeigt eigene Schritte.
+const v761OldRenderTimelineForTask = renderTimelineForTaskV39;
+renderTimelineForTaskV39 = function(t){
+  const typ = t?.typ || "";
+  const d = t?.details || {};
+  const abgeschlossen = (t.done || t.archived) ? "done" : "";
+
+  if(v761IsReplacementTask(t)){
+    const hasReq = (t.requests || []).length > 0;
+    const confirmed = (t.requests || []).some(r => r.status === REQ_STATUS.bestaetigt);
+    return renderTimelineV39([
+      {label:"Ersatzbedarf", state:"done"},
+      {label:"Ersatz-MA wählen", state: hasReq ? "done" : "wait"},
+      {label:"Rückmeldung", state: confirmed ? "done" : (hasReq ? "wait" : "")},
+      {label:"Abschluss", state: abgeschlossen}
+    ]);
+  }
+
+  if(typ === "dienstaenderung"){
+    const repl = v761FindReplacementForChange(t);
+    return renderTimelineV39([
+      {label:"Fall aufgenommen", state:"done"},
+      {label:"Ersatzplanung", state: repl ? (repl.done ? "done" : "wait") : (d.changeReplacement === "nein" ? "done" : "")},
+      {label:"Antwortmail", state: d.changeMailPrepared ? "done" : ""},
+      {label:"Entscheid", state: (d.changeDecision && d.changeDecision !== "offen") ? (d.changeDecision === "positiv" ? "done" : "problem") : ""},
+      {label:"Abschluss", state: abgeschlossen}
+    ]);
+  }
+
+  return v761OldRenderTimelineForTask ? v761OldRenderTimelineForTask(t) : renderTaskTimeline(t);
+};
+try{ renderTaskTimeline = renderTimelineForTaskV39; window.renderTaskTimeline = renderTimelineForTaskV39; }catch(_){ }
+
+// Beim Öffnen einer verknüpften Ersatzplanung die Maske passend beschriften.
+const v761OldOpenTaskModal = openTaskModal;
+openTaskModal = function(existing){
+  v761OldOpenTaskModal.apply(this, arguments);
+  setTimeout(()=>{
+    const box = Array.from(document.querySelectorAll('.overlay-box')).pop();
+    if(!box || !existing || !v761IsReplacementTask(existing)) return;
+    const title = box.querySelector('.modalHeader div[style*="font-weight"]');
+    if(title) title.textContent = 'Ersatzplanung / neuer Mitarbeiter geplant';
+    const custMode = box.querySelector('#mCustomerMode');
+    if(custMode) custMode.classList.add('is-hidden');
+    const pick = box.querySelector('#mPickMainStaff');
+    if(pick) pick.textContent = 'Ersatz-Mitarbeiter auswählen';
+    const prep = box.querySelector('#mPrepareRequest');
+    if(prep){ prep.classList.remove('is-hidden'); prep.textContent = 'Mail an Ersatz-MA vorbereiten'; }
+    const reply = box.querySelector('#mReply');
+    if(reply) reply.classList.add('is-hidden');
+    const hint = box.querySelector('#mMainStaffDuty');
+    if(hint && existing.details?.replacementForText){
+      hint.textContent = 'Ersatzplanung für: ' + existing.details.replacementForText;
+    }
+  },0);
+};
+
+
   setTimeout(initI18n, 0);
 
 })();
+
+
+/* ===== V7.62 Ersatzplanung auch bei Krankmeldung als verknüpfter Folgeprozess ===== */
+v761IsReplacementTask = function(t){
+  if(!t) return false;
+  const d = t.details || {};
+  if(t.typ === "ersatzplanung") return true;
+  if(t.typ !== "neuer_ma_geplant") return false;
+  return !!(
+    d.sourceProcess === "dienstwechsel_ersatzplanung" ||
+    d.sourceProcess === "krankmeldung_ersatzplanung" ||
+    d.parentChangeId ||
+    d.parentKrankId ||
+    d.sourceTaskId ||
+    d.parentInternalVorgangId ||
+    d.changeSubtype === "ersatzplanung"
+  );
+};
+
+// Gruppierung erneut setzen, damit echte Ersatzplanungen aus Dienständerung und Krankmeldung getrennt angezeigt werden.
+v724TaskTypeGroup = function(t){
+  if(t.statusGesamt === OVERALL.eskalation) return "00|Eskalation / Konflikte";
+  if(t.typ === "haz" || t.details?.changeSubtype === "haz") return "10|HAZ";
+  if(t.typ === "anfrage_kunde") return "20|Kundenanfragen";
+  if(v761IsReplacementTask(t)) return "25|Ersatzplanung / neuer Mitarbeiter geplant";
+  if(t.typ === "krankmeldung") return "30|Krankmeldungen";
+  if(t.typ === "dienstaenderung") return "40|Dienständerungen";
+  if(t.typ === "ereignis_kunde" || t.typ === "ereignis") return "50|Ereignisse";
+  if(t.typ === "notiz") return "60|Notizen";
+  return "90|Sonstige Vorgänge";
+};
+
 </script>
 
 </body>
