@@ -3906,8 +3906,7 @@
     addSection(lines, "Vorgänge offen:", offene, "keine offenen Vorgänge");
     addSection(lines, "Vorgänge bearbeitet / in Abklärung:", bearbeitet, "keine Vorgänge in Bearbeitung");
     addSection(lines, "Vorgänge abgeschlossen:", abgeschlossen, "keine abgeschlossenen Vorgänge");
-    return lines.join("
-").trim();
+    return lines.join("\n").trim();
   }
 
   function buildCloudPayload(latestHandover){
