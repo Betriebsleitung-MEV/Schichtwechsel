@@ -644,11 +644,11 @@
       </button>
       <button type="button" class="v724-typeCard" data-newtyp-inline="haz">
         <div class="v724-typeTitle">HAZ</div>
-        <div class="v724-typeHint">Heisse Überzeit mit 72h-Frist beobachten/ausgleichen.</div>
+        <div class="v724-typeHint">Heisse Überzeit mit 72h-Frist beobachten/ausgleichen; nicht nötig wird nicht in den aktiven Status übernommen.</div>
       </button>
       <button type="button" class="v724-typeCard" data-newtyp-inline="ereignis_kunde">
         <div class="v724-typeTitle">Ereignis</div>
-        <div class="v724-typeHint">Minimal vorerfassen und Ereignismeldung öffnen.</div>
+        <div class="v724-typeHint">Ereignis-HTML direkt öffnen.</div>
       </button>
       <button type="button" class="v724-typeCard" data-newtyp-inline="meldeformular">
         <div class="v724-typeTitle">Meldeformular</div>
@@ -764,7 +764,7 @@
 
     <div class="field filterSearch">
       <div style="font-weight:900;margin-bottom:6px;">Suche</div>
-      <input id="q" placeholder="Titel, Kunde, Name, IncidentId, Zug ..." />
+      <input id="q" placeholder="Titel, Kunde, Name, Zug, Relation ..." />
       <div class="hint">Filtert die Liste.</div>
     </div>
   </div>
@@ -943,7 +943,11 @@
   // Wichtig: URLs nicht in öffentliche Repos committen, wenn sie geheim bleiben sollen.
   const SAVE_FLOW_URL = "https://defaulte3d2e8defe3548eaa78972c4a2acf9.8e.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/65bc7671fea74239aac0591a56f69d81/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=lFqDM4fusltfTyo-g0czYt8Yhl95IMlQWkim3fK3ZWk";
   const LOAD_FLOW_URL = "https://defaulte3d2e8defe3548eaa78972c4a2acf9.8e.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/6160c1c3992a484f8da2bcd91b6183fe/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=a7Nb6s9h350_P2aVzkXv8T8d-KcIuZyBYxX3vXlkOyA";
+  // Optionaler zweiter Flow: liest die SharePoint-Ereignisliste und übernimmt daraus offene/nachträgliche Aufgaben.
+  // Ereignisse selbst bleiben extern; nur Aufgaben/Folgepunkte aus der Ereignisliste werden hier als Vorgänge geführt.
+  const LOAD_EVENTS_FLOW_URL = "HIER_DEINE_EVENTS_LOAD_FLOW_URL";
   const CLOUD_ENABLED = !SAVE_FLOW_URL.includes("HIER_DEINE") && !LOAD_FLOW_URL.includes("HIER_DEINE");
+  const EVENTS_FLOW_ENABLED = !!LOAD_EVENTS_FLOW_URL && !LOAD_EVENTS_FLOW_URL.includes("HIER_DEINE");
 
   const TYPEN = [
     { key:"anfrage_kunde", label:"Anfrage Kunde", title:"Anfrage Kunde – Rückmeldung ausstehend" },
@@ -954,7 +958,8 @@
     { key:"dienstaenderung", label:"Dienständerung", title:"Dienständerung – Nachverfolgung" },
     { key:"haz", label:"HAZ / Heisse Überzeit", title:"HAZ – beobachten / ausgleichen" },
     { key:"notiz", label:"Notiz", title:"Notiz – kurzer Hinweis" },
-    { key:"neuer_ma_geplant", label:"Neuer Mitarbeitender geplant", title:"Neuer Mitarbeitender geplant – Anfrage" }
+    { key:"neuer_ma_geplant", label:"Neuer Mitarbeitender geplant", title:"Neuer Mitarbeitender geplant – Anfrage" },
+    { key:"ereignis_aufgabe", label:"Aufgabe aus Ereignis", title:"Aufgabe aus Ereignis – Folgepunkt" }
   ];
 
   const REQ_STATUS = {
@@ -991,6 +996,78 @@
     return d.toLocaleString("de-CH",{year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"});
   }
   function uid(){ return "T" + Math.random().toString(16).slice(2) + Date.now().toString(16); }
+
+  // Interne Vorgangs-ID für SharePoint-Listen.
+  // Ereignisse sind ausgenommen, weil die Ereignis-ID im Ereignisformular erzeugt wird.
+  function isExternalEventTask(t){
+    return t && (t.typ === "ereignis_kunde" || t.typ === "ereignis");
+  }
+
+  function makeInternalVorgangId(task){
+    const d = task?.createdAt ? new Date(task.createdAt) : new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth()+1).padStart(2,"0");
+    const day = String(d.getDate()).padStart(2,"0");
+    const typ = String(task?.typ || "vorgang")
+      .replace(/[^a-zA-Z0-9]+/g,"_")
+      .replace(/^_+|_+$/g,"")
+      .toUpperCase()
+      .slice(0,18) || "VORGANG";
+    const seed = String(task?.id || uid()).replace(/[^a-zA-Z0-9]/g,"").slice(-6).toUpperCase();
+    return `MEV-${y}${m}${day}-${typ}-${seed}`;
+  }
+
+  function ensureInternalVorgangId(task){
+    if(!task || isExternalEventTask(task)) return task;
+    if(!task.internalVorgangId){
+      task.internalVorgangId = makeInternalVorgangId(task);
+    }
+    return task;
+  }
+
+  function cloneForExport(obj){
+    return JSON.parse(JSON.stringify(obj || null));
+  }
+
+  function exportAllVorgangData(){
+    return (state.tasks || [])
+      .filter(t => !isExternalEventTask(t))
+      .map(t => {
+        ensureInternalVorgangId(t);
+        const out = cloneForExport(t);
+        out.statusGesamt = computeOverallStatus(t);
+        out.exportedAt = nowIso();
+        return out;
+      });
+  }
+
+
+  function sharePointListTasks(){
+    return (state.tasks || [])
+      .filter(t => !isExternalEventTask(t))
+      .filter(t => !t.done && !t.archived)
+      .map(t => ensureInternalVorgangId(t))
+      .map(t => ({
+        internalVorgangId: t.internalVorgangId,
+        localId: t.id,
+        typ: t.typ || "",
+        typLabel: t.typLabel || "",
+        titel: t.titel || "",
+        kundeEvuId: t.kundeEvuId || "",
+        kundeLabel: t.kundeLabel || "",
+        shift: t.shift || "",
+        status: t.statusGesamt || computeOverallStatus(t),
+        datum: t.details?.datum || t.details?.eventDatum || (t.createdAt || "").slice(0,10),
+        dienst: t.details?.dienst || t.dienst || "",
+        zug: t.zug || "",
+        ort: t.ort || t.details?.vonNach || "",
+        mitarbeiterName: t.details?.mitarbeiterName || t.details?.eventMitarbeiterName || "",
+        createdAt: t.createdAt || "",
+        updatedAt: t.updatedAt || "",
+        done: !!t.done,
+        archived: !!t.archived
+      }));
+  }
 
   function escapeHtml(s){
     return String(s ?? "")
@@ -1040,7 +1117,10 @@
   // taskDuplicateKey ist später definiert; Normalisierung erfolgt beim ersten Render über safeNormalizeTasks().
   function safeNormalizeTasks(){
     try{
-      (state.tasks||[]).forEach(t=>{ if(t.typ === "dienstaenderung" && t.details?.changeSubtype === "haz"){ t.typ = "haz"; t.typLabel = "HAZ / Heisse Überzeit"; } });
+      (state.tasks||[]).forEach(t=>{
+        if(t.typ === "dienstaenderung" && t.details?.changeSubtype === "haz"){ t.typ = "haz"; t.typLabel = "HAZ / Heisse Überzeit"; }
+        ensureInternalVorgangId(t);
+      });
       const seen = new Set();
       state.tasks = (state.tasks||[]).filter(t=>{
         const d=t.details||{}; const typ=(t.typ === "dienstaenderung" && d.changeSubtype === "haz") ? "haz" : (t.typ||"");
@@ -1505,66 +1585,90 @@
   }
 
   function taskTimelineSteps(t, status){
+    const typ = t.typ || "";
+    const d = t.details || {};
     const req = t.requests || [];
     const anyRequested = req.length > 0;
-    const anyAnswered = req.some(r=>[REQ_STATUS.bestaetigt, REQ_STATUS.abgelehnt, REQ_STATUS.keineAntwort, REQ_STATUS.nichtNoetig].includes(r.status));
     const anyConfirmed = req.some(r=>r.status===REQ_STATUS.bestaetigt);
-    const closedStatuses = [REQ_STATUS.bestaetigt, REQ_STATUS.abgelehnt, REQ_STATUS.keineAntwort, REQ_STATUS.nichtNoetig];
-    const allAnswered = req.length && req.every(r=>closedStatuses.includes(r.status));
-    const allNegative = req.length && allAnswered && !anyConfirmed && req.some(r=>r.status===REQ_STATUS.abgelehnt || r.status===REQ_STATUS.keineAntwort);
+    const anyNegative = req.some(r=>r.status===REQ_STATUS.abgelehnt || r.status===REQ_STATUS.keineAntwort);
+    const mailPrepared = !!(d.mailPrepared || d.requestMailPrepared || d.changeMailPrepared || d.responseMailPrepared);
+    const replacementStarted = d.ersatzplanung === "starten" || d.ersatzplanung === "teilweise" || !!d.replacementTaskId || (Array.isArray(d.krankReplacementTasks) && d.krankReplacementTasks.length > 0);
+    const replacementNotNeeded = d.ersatzplanung === "nicht_noetig" || d.changeReplacement === "nein";
 
-    if(t.typ === "haz" || t.details?.changeSubtype === "haz"){
-      const hs = t.details?.hazStatus || "beobachten";
-      return [
-        {label:"Erfasst", cls:"done"},
-        {label:"Beobachten", cls:(hs==="beobachten" || hs==="auszugleichen") ? "wait" : "done"},
-        {label:"Ausgleich", cls:hs==="ausgeglichen" ? "done" : (hs==="nicht_noetig" ? "done" : "open")},
-        {label:"Abschluss", cls:(t.done || hs==="ausgeglichen" || hs==="nicht_noetig") ? "done" : "open"}
-      ];
+    if(typ === "ereignis_kunde" || typ === "ereignis"){
+      // Ereignisse werden im Ereignisformular geführt. In der Übergabe gibt es keinen eigenen Verlauf.
+      return [];
     }
 
-    if(t.typ === "krankmeldung"){
+    if(typ === "krankmeldung"){
       return [
         {label:"Aufgenommen", cls:"done"},
-        {label:"Ersatzplanung", cls:t.details?.ersatzplanung==="starten" ? "wait" : "open"},
-        {label:"Abgeschlossen", cls:t.done ? "done" : "open"}
-      ];
-    }
-
-    if(t.typ === "ereignis_kunde" || t.typ === "ereignis"){
-      return [
-        {label:"Vorerfasst", cls:"done"},
-        {label:"Meldung geöffnet", cls:t.details?.eventOpened ? "done" : "open"},
-        {label:"EL-Bestätigung", cls:t.details?.eventElConfirmed ? "done" : "wait"},
+        {label:"Dienste geprüft", cls:(Array.isArray(d.krankDuties) && d.krankDuties.length) ? "done" : "wait"},
+        {label:"Ersatzplanung", cls:replacementStarted ? "done" : (replacementNotNeeded ? "done" : "open")},
         {label:"Abschluss", cls:t.done ? "done" : "open"}
       ];
     }
 
-    if(t.typ === "dienstaenderung"){
-      const decision = t.details?.changeDecision || "";
-      const needsReplacement = t.details?.changeReplacement === "ja";
-      if(needsReplacement || anyRequested){
-        return [
-          {label:"Erfasst", cls:"done"},
-          {label:"Anfrage MA", cls:anyRequested ? "done" : "open"},
-          {label:"Antwort MA", cls:anyConfirmed ? "done" : (allNegative ? "problem" : (anyRequested ? "wait" : "open"))},
-          {label:"Entscheid", cls:decision==="positiv" ? "done" : (decision==="negativ" ? "problem" : "open")},
-          {label:"Abschluss", cls:t.done ? "done" : "open"}
-        ];
-      }
+    if(typ === "dienstaenderung"){
+      const decision = d.changeDecision || "offen";
       return [
-        {label:"Erfasst", cls:"done"},
-        {label:"In Abklärung", cls:t.done ? "done" : "wait"},
-        {label:"Abgeschlossen", cls:t.done ? "done" : "open"}
+        {label:"Fall aufgenommen", cls:"done"},
+        {label:"Ersatzplanung", cls:replacementStarted ? "done" : (replacementNotNeeded ? "done" : "wait")},
+        {label:"Antwortmail", cls:mailPrepared ? "done" : "open"},
+        {label:"Entscheid", cls:decision === "positiv" ? "done" : (decision === "negativ" ? "problem" : "open")},
+        {label:"Abschluss", cls:t.done ? "done" : "open"}
       ];
     }
 
-    const decision = t.details?.customerDecision || "";
+    if(typ === "haz" || d.changeSubtype === "haz"){
+      const hs = d.hazStatus || "beobachten";
+      return [
+        {label:"HAZ aufgenommen", cls:"done"},
+        {label:"Fallaufnahme-Mail", cls:mailPrepared ? "done" : "open"},
+        {label:"Beobachten", cls:(hs === "beobachten" || hs === "auszugleichen") ? "wait" : "done"},
+        {label:"Ausgleich / nicht nötig", cls:(hs === "ausgeglichen" || hs === "nicht_noetig") ? "done" : "open"},
+        {label:"Abschluss", cls:(t.done || hs === "ausgeglichen" || hs === "nicht_noetig") ? "done" : "open"}
+      ];
+    }
+
+    if(typ === "meldeformular"){
+      return [
+        {label:"Erfasst", cls:"done"},
+        {label:"Dokumentiert", cls:t.updatedAt ? "done" : "open"},
+        {label:"Abschluss", cls:t.done ? "done" : "open"}
+      ];
+    }
+
+    if(typ === "zugmeldung_tanklager"){
+      return [
+        {label:"Erfasst", cls:"done"},
+        {label:"Gespeichert / gemeldet", cls:t.updatedAt ? "done" : "open"},
+        {label:"Abschluss", cls:t.done ? "done" : "open"}
+      ];
+    }
+
+    if(typ === "notiz"){
+      return [
+        {label:"Erfasst", cls:"done"},
+        {label:"Abschluss", cls:t.done ? "done" : "open"}
+      ];
+    }
+
+    if(typ === "ereignis_aufgabe"){
+      const extClosed = d.eventTaskClosed || d.eventStatusClosed;
+      return [
+        {label:"Aus Ereignisliste", cls:"done"},
+        {label:"Aufgabe offen", cls:(t.done || extClosed) ? "done" : "wait"},
+        {label:"Abschluss", cls:t.done ? "done" : "open"}
+      ];
+    }
+
+    const decision = d.customerDecision || "";
     return [
       {label:"Kunde fragt", cls:"done"},
-      {label:"Anfrage MA", cls:anyRequested ? "done" : "open"},
-      {label:"Antwort MA", cls:anyConfirmed ? "done" : (allNegative ? "problem" : (anyRequested ? "wait" : "open"))},
-      {label:"Entscheid Kunde", cls:decision==="positiv" ? "done" : (decision==="negativ" ? "problem" : "open")},
+      {label:"Mail / Anfrage MA", cls:(mailPrepared || anyRequested) ? "done" : "open"},
+      {label:"Antwort MA", cls:anyConfirmed ? "done" : (anyNegative ? "problem" : (anyRequested ? "wait" : "open"))},
+      {label:"Entscheid Kunde", cls:decision === "positiv" ? "done" : (decision === "negativ" ? "problem" : "open")},
       {label:"Abschluss", cls:t.done ? "done" : "open"}
     ];
   }
@@ -1572,9 +1676,175 @@
   function renderTaskTimeline(t){
     const status = t.statusGesamt || computeOverallStatus(t);
     const steps = taskTimelineSteps(t, status);
+    if(!steps.length) return "";
     return `<div class="taskTimeline" title="Vorgangsverlauf">${steps.map((st, idx)=>`
       <div class="tlStep ${escapeHtml(st.cls)}"><span class="tlDot"></span><span class="tlLabel">${escapeHtml(st.label)}</span></div>${idx < steps.length-1 ? `<span class="tlLine"></span>` : ``}
     `).join("")}</div>`;
+  }
+
+  function changeTaskTitle(task){
+    const d = task?.details || {};
+    const name = d.mitarbeiterName || d.eventMitarbeiterName || "Mitarbeiter";
+    const datum = d.datum || d.eventDatum || (task?.createdAt || "").slice(0,10) || "Datum";
+    return `${name} - ${datum} - Dienstwechsel`;
+  }
+
+  function firstNameFromAnyDisplayName(name){
+    const raw = String(name || "").trim();
+    if(!raw) return "";
+    if(raw.includes(",")) return raw.split(",").slice(1).join(",").trim().split(/\s+/)[0] || raw;
+    const parts = raw.split(/\s+/).filter(Boolean);
+    return parts.length ? parts[0] : raw;
+  }
+
+  function prepareChangeResponseMail(task){
+    const d = task.details || {};
+    const isHazCase = task.typ === "haz" || d.changeSubtype === "haz";
+    const to = (d.mitarbeiterMail || "").trim();
+    const name = d.mitarbeiterName || "";
+    const vorname = firstNameFromAnyDisplayName(name);
+
+    if(isHazCase){
+      const hs = d.hazStatus === "ausgeglichen" ? "ausgeglichen" : (d.hazStatus === "nicht_noetig" ? "nicht mehr nötig" : "zur Abklärung aufgenommen");
+      const subject = `HAZ Fallaufnahme ${d.datum || ""} ${d.dienst || task.dienst || ""} – ${hs}`.trim();
+      const body = [
+        `Hallo ${vorname || ""}`.trim(),
+        "",
+        "deine Meldung zur HAZ / heissen Überzeit wurde aufgenommen.",
+        "",
+        `Mitarbeiter: ${name || "—"}`,
+        `Datum: ${d.datum || "—"}`,
+        `Dienst: ${d.changeOldDienst || d.bisherigePlanung || d.dienst || task.dienst || "—"}`,
+        `Aktueller Status: ${hs}`,
+        d.hazDeadline ? `Ausgleich / Prüfung bis: ${d.hazDeadline}` : "",
+        d.changeNewDienst ? `Massnahme / Hinweis: ${d.changeNewDienst}` : "",
+        task.notiz ? `Notiz: ${task.notiz}` : "",
+        "",
+        d.hazStatus === "nicht_noetig"
+          ? "Der Fall wird nicht in den aktiven Tagesstatus übernommen."
+          : "Wir melden uns, sobald die Abklärung abgeschlossen ist.",
+        "",
+        "Freundliche Grüsse",
+        "Dispo / Besno"
+      ].filter(Boolean).join("\n");
+      task.details = d;
+      d.changeMailPrepared = true;
+      task.updatedAt = nowIso();
+      saveState();
+      window.location.href = `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+      return;
+    }
+
+    const entscheid = d.changeDecision === "positiv" ? "genehmigt" : (d.changeDecision === "negativ" ? "abgelehnt" : "in Bearbeitung aufgenommen");
+    const subject = `Dienstwechsel ${d.datum || ""} ${d.dienst || task.dienst || ""} – ${entscheid}`.trim();
+    const body = [
+      `Hallo ${vorname || ""}`.trim(),
+      "",
+      "deine Anfrage zum Dienstwechsel wurde aufgenommen.",
+      "",
+      `Mitarbeiter: ${name || "—"}`,
+      `Datum: ${d.datum || "—"}`,
+      `Bisheriger Dienst: ${d.changeOldDienst || d.bisherigePlanung || d.dienst || task.dienst || "—"}`,
+      `Gewünschte Änderung: ${d.changeNewDienst || "—"}`,
+      `Aktueller Status: ${entscheid}`,
+      d.changeReason ? `Hinweis / Grund: ${d.changeReason}` : "",
+      task.notiz ? `Notiz: ${task.notiz}` : "",
+      "",
+      "Wir melden uns, sobald die Ersatzplanung bzw. Abklärung abgeschlossen ist.",
+      "",
+      "Freundliche Grüsse",
+      "Dispo / Besno"
+    ].filter(Boolean).join("\n");
+    task.details = d;
+    d.changeMailPrepared = true;
+    task.updatedAt = nowIso();
+    saveState();
+    window.location.href = `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  }
+
+  function createReplacementFromChange(task){
+    const d = task.details || {};
+    const name = d.mitarbeiterName || d.eventMitarbeiterName || "";
+    const dienst = d.dienst || task.dienst || "";
+    const datum = d.datum || (task.createdAt || "").slice(0,10);
+    const repl = {
+      id: uid(),
+      internalVorgangId: "",
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      shift: task.shift || state.ui.shift || "Tag",
+      kundeEvuId: task.kundeEvuId || "",
+      kundeLabel: task.kundeLabel || "",
+      typ: "dienstaenderung",
+      typLabel: "Dienständerung",
+      titel: `Ersatzplanung – ${name || "Mitarbeiter"}${datum ? " – " + datum : ""}${dienst ? " – " + dienst : ""}`,
+      zug: task.zug || dienst || "",
+      dienst: dienst,
+      ort: task.ort || d.vonNach || "",
+      incidentId: "",
+      notiz: `Aus Dienstwechsel erstellt.${task.notiz ? "\n" + task.notiz : ""}`,
+      requests: [],
+      details: {
+        mitarbeiterName: name,
+        mitarbeiterMail: d.mitarbeiterMail || "",
+        mitarbeiterTel: d.mitarbeiterTel || "",
+        dienst: dienst,
+        datum: datum,
+        zeit: d.zeit || "",
+        vonNach: d.vonNach || task.ort || "",
+        bisherigePlanung: d.changeOldDienst || d.bisherigePlanung || "",
+        changeSubtype: "ersatz",
+        changeTrigger: "dienstwechsel",
+        changeReplacement: "ja",
+        changeOldDienst: d.changeOldDienst || d.bisherigePlanung || "",
+        changeNewDienst: d.changeNewDienst || "",
+        changeDecision: "offen",
+        changeReason: "",
+        parentChangeId: task.id
+      },
+      done:false,
+      archived:false
+    };
+    task.details = d;
+    d.changeReplacement = "ja";
+    d.replacementTaskId = repl.id;
+    task.updatedAt = nowIso();
+    state.tasks.unshift(repl);
+    saveState();
+    safeRender();
+    alert("Ersatzplanung wurde als eigener Tagesstatus-/Dienständerungs-Vorgang angelegt.");
+  }
+
+  function buildTaskActionsHtml(t, status){
+    const id = escapeHtml(t.id);
+    const typ = t.typ || "";
+    const isDone = !!t.done;
+    const isHaz = typ === "haz" || t.details?.changeSubtype === "haz";
+    const isChange = typ === "dienstaenderung";
+    const isCustomer = typ === "anfrage_kunde" || typ === "neuer_ma_geplant";
+    const isEventFollowUp = typ === "ereignis_aufgabe";
+
+    const parts = [];
+    parts.push(`<button class="btn-primary" data-act="edit" data-id="${id}">${isDone ? "Öffnen / ansehen" : "Öffnen / bearbeiten"}</button>`);
+
+    if(!isDone){
+      if(isCustomer){
+        parts.push(`<button class="btn-blue" data-act="reply" data-id="${id}">Antwort / Kundenentscheid</button>`);
+      }else if(isChange){
+        parts.push(`<button class="btn-blue" data-act="reply" data-id="${id}">Antwortmail vorbereiten</button>`);
+        parts.push(`<button class="btn-secondary" data-act="ask" data-id="${id}">Ersatzplanung starten</button>`);
+      }else if(isHaz){
+        parts.push(`<button class="btn-blue" data-act="reply" data-id="${id}">Fallaufnahme-Mail vorbereiten</button>`);
+      }else if(isEventFollowUp){
+        parts.push(`<button class="btn-secondary" data-act="eventDone" data-id="${id}">Aufgabe erledigt</button>`);
+      }
+      parts.push(`<button class="btn-secondary" data-act="done" data-id="${id}">Abschliessen</button>`);
+    }else{
+      parts.push(`<button class="btn-secondary" data-act="reopen" data-id="${id}">Wiedereröffnen</button>`);
+      parts.push(`<details class="taskMore"><summary>Weitere Aktionen</summary><div class="taskMoreInner"><button class="btn-danger" data-act="del" data-id="${id}">Archivieren</button></div></details>`);
+    }
+
+    return parts.join("\n");
   }
 
   function renderTaskRow(t){
@@ -1586,6 +1856,7 @@
     const relation = escapeHtml(t.ort || "—");
     const anfragen = escapeHtml(reqSummary(t));
     const empfaenger = (t.requests||[]).length;
+    const cardActionsHtml = buildTaskActionsHtml(t, status);
     const urgent = status===OVERALL.eskalation ? `<div class="taskUrgentHint">Aktion erforderlich: keine verwertbare Rückmeldung vorhanden.</div>` : ``;
     return `
       <div class="row taskCard" data-typ="${escapeHtml(t.typ||"")}">
@@ -1594,7 +1865,7 @@
           <div class="taskHead">
             <div>
               <div class="taskTitle"><span class="typeBadge ${escapeHtml((t.typ==="haz"||t.details?.changeSubtype==="haz") ? "haz" : (t.typ==="ereignis_kunde" ? "ereignis" : (t.typ==="krankmeldung" ? "krank" : "")))}">${escapeHtml((t.typ==="haz"||t.details?.changeSubtype==="haz") ? "HAZ" : (t.typLabel||"Vorgang"))}</span>${title}</div>
-              <div class="taskSub">${kunde} · ${escapeHtml(t.shift||"—")} · ${escapeHtml(t.typLabel||"Vorgang")}</div>
+              <div class="taskSub">${kunde} · ${escapeHtml(t.shift||"—")} · ${escapeHtml(t.typLabel||"Vorgang")}${t.internalVorgangId ? " · ID " + escapeHtml(t.internalVorgangId) : ""}</div>
             </div>
             <div class="taskPrimaryStatus">${chipStatus(status)}</div>
           </div>
@@ -1612,16 +1883,7 @@
           <div class="taskHistoryMini">Erstellt: ${fmtTs(t.createdAt)}${t.incidentId ? " · ID: "+escapeHtml(t.incidentId) : ""}</div>
         </div>
         <div class="taskActionsPanel actions">
-          <button class="btn-primary" data-act="edit" data-id="${t.id}">Öffnen / bearbeiten</button>
-          <button class="btn-blue" data-act="reply" data-id="${t.id}">${(t.typ==="anfrage_kunde"||t.typ==="neuer_ma_geplant") ? "Antwort MA / Entscheid" : (t.typ==="haz"||t.details?.changeSubtype==="haz" ? "HAZ bearbeiten" : "Status / Antworten")}</button>
-          <button class="btn-secondary" data-act="ask" data-id="${t.id}">Anfrage vorbereiten</button>
-          <button class="btn-secondary" data-act="done" data-id="${t.id}">Abschliessen</button>
-          <details class="taskMore">
-            <summary>Weitere Aktionen</summary>
-            <div class="taskMoreInner">
-              <button class="btn-danger" data-act="del" data-id="${t.id}">Archivieren</button>
-            </div>
-          </details>
+          ${cardActionsHtml}
         </div>
       </div>
     `;
@@ -1777,9 +2039,17 @@
           if(!t) return;
 
           if(act==="edit") openTaskModal(t);
-          if(act==="ask") openAskModal(t);
-          if(act==="reply") openReplyModal(t);
+          if(act==="ask"){
+            if(t.typ === "dienstaenderung") createReplacementFromChange(t);
+            else openAskModal(t);
+          }
+          if(act==="reply"){
+            if(t.typ === "dienstaenderung" || t.typ === "haz" || t.details?.changeSubtype === "haz") prepareChangeResponseMail(t);
+            else openReplyModal(t);
+          }
+          if(act==="eventDone"){ t.done=true; t.details ||= {}; t.details.eventTaskClosed=true; t.updatedAt=nowIso(); saveState(); safeRender(); }
           if(act==="done"){ t.done=true; t.updatedAt=nowIso(); saveState(); safeRender(); }
+          if(act==="reopen"){ t.done=false; t.archived=false; t.updatedAt=nowIso(); ensureInternalVorgangId(t); saveState(); safeRender(); }
           if(act==="del"){
             if(!confirm("Vorgang archivieren und aus der aktiven Liste ausblenden?")) return;
             t.archived = true;
@@ -1934,6 +2204,7 @@
   }
 
   function addOrUpdateTask(t, isNew){
+    ensureInternalVorgangId(t);
     const dup = isNew ? findOpenDuplicateTask(t) : null;
     if(dup){
       const openIt = confirm("Diesen offenen Vorgang gibt es bereits. Bestehenden Vorgang öffnen statt doppelt erstellen?");
@@ -1949,6 +2220,7 @@
     const isNew = !existing || !!existing.__isNew;
     const t = existing ? existing : {
       id: uid(),
+      internalVorgangId: "",
       createdAt: nowIso(),
       updatedAt: nowIso(),
       shift: state.ui.shift || "Früh",
@@ -2001,65 +2273,66 @@
 
       <div class="modalSubsection is-hidden" id="mCustomerMode">
         <h3>Kundenanfrage – Ausgangslage</h3>
+        <div class="field readonlyShift" style="margin-bottom:10px;">
+          <div style="font-weight:900;margin-bottom:6px;">Erfasst durch Dispo / Besno</div>
+          <input id="mShift" value="${escapeHtml(t.shift||state.ui.shift||"")}" readonly aria-readonly="true">
+          <div class="hint">Wird automatisch im Hintergrund aus der aktuellen Dispo-/Besno-Schicht gespeichert.</div>
+        </div>
+        <div class="row-2">
+          <div class="field"><div style="font-weight:900;margin-bottom:6px;">Schichtbezeichnung *</div><input id="mSchichtBez" value="${escapeHtml(t.details?.schichtBezeichnung || t.details?.dienst || t.dienst || "")}" placeholder="z.B. GTS_02 / MDW_01 / Zusatzdienst"></div>
+          <div class="field"><div style="font-weight:900;margin-bottom:6px;">Dienstanfang Uhrzeit *</div><input id="mDienstAnfang" value="${escapeHtml(t.details?.dienstAnfang || "")}" placeholder="z.B. 08:00"></div>
+        </div>
+        <div class="row-2">
+          <div class="field"><div style="font-weight:900;margin-bottom:6px;">Anfangsort *</div><input id="mAnfangsort" value="${escapeHtml(t.details?.anfangsort || "")}" placeholder="aus station.json übernehmen oder überschreiben"></div>
+          <div class="field"><div style="font-weight:900;margin-bottom:6px;">Zugnummern</div><textarea id="mZugnummern" rows="2" placeholder="eine oder mehrere Zugnummern, z.B. 47037 / 47038">${escapeHtml(t.details?.zugnummern || t.zug || "")}</textarea></div>
+        </div>
+        <div class="row-2">
+          <div class="field"><div style="font-weight:900;margin-bottom:6px;">Zugziel</div><input id="mZugziel" value="${escapeHtml(t.details?.zugziel || "")}" placeholder="aus station.json übernehmen oder überschreiben"></div>
+          <div class="field"><div style="font-weight:900;margin-bottom:6px;">Dienstende Uhrzeit</div><input id="mDienstende" value="${escapeHtml(t.details?.dienstende || "")}" placeholder="z.B. 16:00"></div>
+        </div>
+        <div class="field"><div style="font-weight:900;margin-bottom:6px;">Endort</div><input id="mEndort" value="${escapeHtml(t.details?.endort || "")}" placeholder="aus station.json übernehmen oder überschreiben"></div>
         <div class="v38-choiceRow">
-          <button type="button" class="btn-secondary v38-choice active" data-cust-mode="existing">Bestehenden Dienst mutieren</button>
-          <button type="button" class="btn-secondary v38-choice" data-cust-mode="newstaff">Neuen Mitarbeiter suchen</button>
+          <button type="button" class="btn-secondary v38-choice active" data-cust-mode="existing">Bestehenden Dienst suchen / optional mutieren</button>
+          <button type="button" class="btn-secondary v38-choice" data-cust-mode="newstaff">Mitarbeiter neu auswählen</button>
         </div>
         <input type="hidden" id="mCustomerModeValue" value="${escapeHtml(t.details?.customerMode || "existing")}">
-        <div class="hint" id="mCustomerModeHint">Wähle zuerst, ob ein bestehender Dienst aus der Tages-CSV angepasst wird oder ob ein neuer Mitarbeiter gesucht werden soll.</div>
+        <div class="hint" id="mCustomerModeHint">Bestehenden Dienst nur suchen, wenn er in der Tagesplanung vorhanden ist. Sonst Mitarbeiter neu auswählen und Dienst manuell erfassen.</div>
         <div class="inlineOk is-hidden" id="mAskStatus"></div>
       </div>
 
       <div class="field" id="mPersonField">
-        <div style="font-weight:900;margin-bottom:6px;">Mitarbeiter / Triggerperson</div>
+        <div style="font-weight:900;margin-bottom:6px;">Mitarbeiter / Kandidat</div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
           <button type="button" class="btn-secondary" id="mPickMainStaff">Mitarbeiter wählen</button>
           <div class="chip blue" id="mMainStaffChip">${escapeHtml(t.details?.mitarbeiterName || t.details?.eventMitarbeiterName || "Noch nicht gewählt")}</div>
         </div>
-        <div class="hint" id="mMainStaffDuty">${escapeHtml(t.details?.mitarbeiterDienstInfo || t.details?.eventDienstInfo || "Nach Auswahl wird der Dienst aus Tagesplanung.csv gesucht. Falls kein Treffer: manuell erfassen.")}</div>
+        <div class="hint" id="mMainStaffDuty">${escapeHtml(t.details?.mitarbeiterDienstInfo || t.details?.eventDienstInfo || "Optional: bestehenden Dienst aus Tagesplanung suchen oder Mitarbeiter ohne bestehenden Dienst auswählen.")}</div>
       </div>
 
-      <div class="row-2">
-        <div class="field readonlyShift">
-          <div style="font-weight:900;margin-bottom:6px;">In welcher Disposchicht erfasst</div>
-          <input id="mShift" value="${escapeHtml(t.shift||state.ui.shift||"")}" placeholder="wird aus der aktuellen Filter-Schicht übernommen" readonly aria-readonly="true">
-          <div class="hint">Automatisch aus der gewählten Disposchicht übernommen. Nur zur Einordnung des Vorgangs.</div>
-        </div>
-        <div class="field" id="mIncidentField">
-          <div style="font-weight:900;margin-bottom:6px;">IncidentId (optional)</div>
-          <input id="mIncident" value="${escapeHtml(t.incidentId||"")}" placeholder="nur falls extern vorhanden" />
-        </div>
+      <div class="field readonlyShift">
+        <div style="font-weight:900;margin-bottom:6px;">Titel automatisch</div>
+        <input id="mTitle" value="${escapeHtml(t.titel||"")}" placeholder="Kunde - Datum - Schichtbezeichnung" readonly aria-readonly="true" />
+        <div class="hint">Wird aus Kunde/EVU, Datum und Schichtbezeichnung gebildet.</div>
       </div>
 
       <div class="field">
-        <div style="font-weight:900;margin-bottom:6px;">Titel *</div>
-        <input id="mTitle" value="${escapeHtml(t.titel||"")}" placeholder="[Kunde] ..." />
+        <div style="font-weight:900;margin-bottom:6px;">Relation</div>
+        <input id="mOrt" value="${escapeHtml(t.ort||"")}" placeholder="z.B. Basel – Chiasso / BEL–BAD" />
       </div>
-
-      <div class="row-2">
-        <div class="field">
-          <div style="font-weight:900;margin-bottom:6px;">Zug (optional)</div>
-          <input id="mZug" value="${escapeHtml(t.zug||"")}" placeholder="z.B. 47037" />
-        </div>
-        <div class="field">
-          <div style="font-weight:900;margin-bottom:6px;">Ort / Relation (optional)</div>
-          <input id="mOrt" value="${escapeHtml(t.ort||"")}" placeholder="z.B. BEL–BAD" />
-        </div>
-      </div>
+      <input type="hidden" id="mIncident" value="${escapeHtml(t.incidentId||"")}">
+      <input type="hidden" id="mZug" value="${escapeHtml(t.zug||"")}">
 
       <div class="modalSubsection" id="mAnfrageDetails">
         <h3>Dienstinformationen / Planung</h3>
-        <div class="row-3">
-          <div class="field"><div style="font-weight:900;margin-bottom:6px;">Dienst</div><input id="mDienst" value="${escapeHtml(t.details?.dienst || t.dienst || "")}" placeholder="z.B. GTS_02 / MDW_01"></div>
-          <div class="field"><div style="font-weight:900;margin-bottom:6px;">Datum</div><input id="mDatum" type="date" value="${escapeHtml(t.details?.datum || "")}"></div>
-          <div class="field"><div style="font-weight:900;margin-bottom:6px;">Bisherige Planung</div><select id="mPlanQuelle"><option value="tagesliste" ${(t.details?.planungQuelle||"")==="tagesliste"?"selected":""}>aus Tagesliste übernehmen</option><option value="manuell" ${(t.details?.planungQuelle||"")==="manuell"?"selected":""}>manuell erfassen</option></select></div>
-        </div>
         <div class="row-2">
-          <div class="field"><div style="font-weight:900;margin-bottom:6px;">Zeit von / bis</div><input id="mZeit" value="${escapeHtml(t.details?.zeit || "")}" placeholder="z.B. 08:00–16:00"></div>
-          <div class="field"><div style="font-weight:900;margin-bottom:6px;">Von / Nach</div><input id="mVonNach" value="${escapeHtml(t.details?.vonNach || t.ort || "")}" placeholder="z.B. Basel – Chiasso"></div>
+          <div class="field"><div style="font-weight:900;margin-bottom:6px;">Datum *</div><input id="mDatum" type="date" value="${escapeHtml(t.details?.datum || "")}"></div>
+          <div class="field"><div style="font-weight:900;margin-bottom:6px;">Bisherige Planung</div><select id="mPlanQuelle"><option value="tagesliste" ${(t.details?.planungQuelle||"")==="tagesliste"?"selected":""}>bestehenden Dienst suchen / aus Tagesliste übernehmen</option><option value="manuell" ${(t.details?.planungQuelle||"")==="manuell"?"selected":""}>kein bestehender Dienst – manuell erfassen</option></select></div>
         </div>
-        <div class="field"><div style="font-weight:900;margin-bottom:6px;">Bisherige Dienstplanung / Zusatzinfo</div><textarea id="mBisherigePlanung" rows="2" placeholder="Aus Tagesliste übernehmen oder manuell beschreiben.">${escapeHtml(t.details?.bisherigePlanung || "")}</textarea></div>
-        <div class="hint">Bei Kundenanfrage/Ersatz/Tausch kann die gewählte Person direkt als Empfänger übernommen werden. Bei HAZ bleibt dieser Block ausgeblendet, sofern keine manuelle Planung nötig ist.</div>
+        <input id="mDienst" type="hidden" value="${escapeHtml(t.details?.dienst || t.dienst || "")}">
+        <input id="mZeit" type="hidden" value="${escapeHtml(t.details?.zeit || "")}">
+        <input id="mVonNach" type="hidden" value="${escapeHtml(t.details?.vonNach || t.ort || "")}">
+        <div class="field"><div style="font-weight:900;margin-bottom:6px;">Zusatzinfo / bisherige Dienstplanung</div><textarea id="mBisherigePlanung" rows="2" placeholder="Wenn der Dienst nicht in der Tagesplanung gefunden wird: Dienst, Zeiten, Besonderheiten hier ergänzen.">${escapeHtml(t.details?.bisherigePlanung || "")}</textarea></div>
+        <div class="hint">Der Mitarbeiter wird beim Speichern automatisch als Anfrage-Empfänger übernommen, sofern eine Person gewählt wurde.</div>
       </div>
 
       <div class="modalSubsection" id="mChangeDetails">
@@ -2136,7 +2409,7 @@
           <div class="hint">Beispiel: krank von Tag X bis Y → alle Dienste im Zeitraum werden angezeigt. Ersatz/Tausch kann pro Dienst separat gestartet werden.</div>
           <div class="sickDutyTools">
             <button type="button" class="btn-secondary" id="mFindSickDuties">Dienste im Zeitraum suchen</button>
-            <button type="button" class="btn-primary" id="mStartAllSickReplacements">Ersatzplanung für alle starten</button>
+            <button type="button" class="btn-primary" id="mStartAllSickReplacements">Ersatzplanung für Dienste im Zeitraum starten</button>
           </div>
           <div class="sickDutyList" id="mSickDutyList"></div>
         </div>
@@ -2275,8 +2548,8 @@
 
       </div>
       <div class="modalFooter">
-        <button type="button" class="btn-secondary" id="mAsk">Mitarbeiter übernehmen</button>
-        <button type="button" class="btn-secondary" id="mPrepareRequest">Anfrage vorbereiten</button>
+        <button type="button" class="btn-secondary is-hidden" id="mAsk">Mitarbeiter automatisch beim Speichern übernehmen</button>
+        <button type="button" class="btn-secondary" id="mPrepareRequest">Mail vorbereiten</button>
         <button type="button" class="btn-blue" id="mReply">Antworten</button>
         <button type="button" class="btn-primary" id="mSave">Speichern</button>
       </div>
@@ -2292,6 +2565,13 @@
     const mTitle = box.querySelector("#mTitle");
     const mZug = box.querySelector("#mZug");
     const mOrt = box.querySelector("#mOrt");
+    const mSchichtBez = box.querySelector("#mSchichtBez");
+    const mDienstAnfang = box.querySelector("#mDienstAnfang");
+    const mAnfangsort = box.querySelector("#mAnfangsort");
+    const mZugnummern = box.querySelector("#mZugnummern");
+    const mZugziel = box.querySelector("#mZugziel");
+    const mDienstende = box.querySelector("#mDienstende");
+    const mEndort = box.querySelector("#mEndort");
     const mDienst = box.querySelector("#mDienst");
     const mDatum = box.querySelector("#mDatum");
     const mPlanQuelle = box.querySelector("#mPlanQuelle");
@@ -2369,14 +2649,60 @@
     const mAskStatus = box.querySelector("#mAskStatus");
 
     let lastSuggestion = "";
+    function firstNameFromDisplayName(name){
+      const raw = String(name || "").trim();
+      if(!raw) return "";
+      if(raw.includes(",")) return raw.split(",").slice(1).join(",").trim().split(/\s+/)[0] || raw;
+      const parts = raw.split(/\s+/).filter(Boolean);
+      return parts.length ? parts[parts.length - 1] : raw;
+    }
+    function buildCustomerTitle(){
+      const kunde = ((mEvu?.value || "") ? evuLabelById(mEvu.value) : "Kunde").trim();
+      const datum = (mDatum?.value || "Datum").trim();
+      const schicht = (mSchichtBez?.value || mDienst?.value || "Schicht").trim();
+      return `${kunde} - ${datum} - ${schicht}`;
+    }
+    function syncCustomerFields(){
+      if(mTyp?.value === "anfrage_kunde" || mTyp?.value === "neuer_ma_geplant"){
+        if(mDienst && mSchichtBez) mDienst.value = mSchichtBez.value || mDienst.value || "";
+        if(mZug && mZugnummern) mZug.value = mZugnummern.value || "";
+        if(mZeit) mZeit.value = [mDienstAnfang?.value || "", mDienstende?.value || ""].filter(Boolean).join("–");
+        if(mVonNach) mVonNach.value = [mAnfangsort?.value || "", mEndort?.value || ""].filter(Boolean).join(" – ");
+        if(mTitle) mTitle.value = buildCustomerTitle();
+      }
+    }
+    function addSelectedStaffAsRequest(task){
+      const d = task.details || {};
+      if(!d.mitarbeiterName) return;
+      task.requests ||= [];
+      const key = d.mitarbeiterMail || d.mitarbeiterName;
+      if(!task.requests.some(r=>r.personId===key || r.mail===d.mitarbeiterMail || r.name===d.mitarbeiterName)){
+        task.requests.push({
+          personId: key,
+          name: d.mitarbeiterName,
+          mail: d.mitarbeiterMail || "",
+          tel: d.mitarbeiterTel || "",
+          status: REQ_STATUS.angefragt,
+          requestedAt: nowIso(),
+          respondedAt: "",
+          dienstInfo: d.mitarbeiterDienstInfo || d.bisherigePlanung || ""
+        });
+      }
+    }
     function buildTitleSuggestion(){
       const evuId = (mEvu.value||"").trim();
       const typKey = mTyp.value;
+      if(typKey === "notiz") return "";
       const typ = TYPEN.find(x=>x.key===typKey) || TYPEN[0];
       const prefix = evuId ? `[${evuLabelById(evuId)}] ` : "";
       return prefix + typ.title;
     }
     function maybeAutoTitle(){
+      if(mTyp?.value === "notiz"){
+        mTitle.value = "";
+        lastSuggestion = "";
+        return;
+      }
       const cur = (mTitle.value||"").trim();
       const next = buildTitleSuggestion();
       if(!cur || cur === lastSuggestion){
@@ -2384,8 +2710,10 @@
       }
       lastSuggestion = next;
     }
-    mEvu.addEventListener("change", maybeAutoTitle);
-    mTyp.addEventListener("change", maybeAutoTitle);
+    mEvu.addEventListener("change", ()=>{ maybeAutoTitle(); syncCustomerFields(); });
+    mTyp.addEventListener("change", ()=>{ maybeAutoTitle(); syncCustomerFields(); });
+    [mSchichtBez,mDienstAnfang,mAnfangsort,mZugnummern,mZugziel,mDienstende,mEndort,mDatum].forEach(el=>el?.addEventListener("input", syncCustomerFields));
+    [mDatum].forEach(el=>el?.addEventListener("change", syncCustomerFields));
 
     lastSuggestion = buildTitleSuggestion();
     if(!t.titel || t.titel.trim()==="") mTitle.value = lastSuggestion;
@@ -2397,7 +2725,16 @@
       const isEvent = typ === "ereignis_kunde" || typ === "ereignis";
       const isMelde = typ === "meldeformular";
       const isTank = typ === "zugmeldung_tanklager";
+      const isKrank = typ === "krankmeldung";
+      const isChange = typ === "dienstaenderung";
+      const isNotiz = typ === "notiz";
       const isHaz = typ === "haz" || (typ === "dienstaenderung" && mChangeSubtype?.value === "haz");
+      box.querySelector("#mAsk")?.classList.toggle("is-hidden", true);
+      box.querySelector("#mPrepareRequest")?.classList.toggle("is-hidden", isMelde || isTank || isKrank || isHaz || isNotiz);
+      box.querySelector("#mReply")?.classList.toggle("is-hidden", isMelde || isTank || isKrank || isNotiz);
+      if(isNotiz && mTitle) mTitle.value = "";
+      if(box.querySelector("#mPrepareRequest")) box.querySelector("#mPrepareRequest").textContent = isChange ? "Ersatzplanung starten" : "Mail vorbereiten";
+      if(box.querySelector("#mReply")) box.querySelector("#mReply").textContent = isHaz ? "Fallaufnahme-Mail vorbereiten" : (isChange ? "Antwortmail vorbereiten" : "Antworten");
       if(typ === "haz" && mChangeSubtype) mChangeSubtype.value = "haz";
       setSectionVisible(box.querySelector("#mCustomerMode"), typ === "anfrage_kunde" || typ === "neuer_ma_geplant");
       setSectionVisible(box.querySelector("#mAnfrageDetails"), typ === "anfrage_kunde" || typ === "neuer_ma_geplant" || (typ === "dienstaenderung" && !isHaz));
@@ -2449,7 +2786,7 @@
       const isHaz = (mTyp?.value === "haz") || mChangeSubtype?.value === "haz";
       mHazRow.classList.toggle("is-hidden", !isHaz);
       if(isHaz && mHazDeadline && !mHazDeadline.value) mHazDeadline.value = defaultHazDeadlineFromPlan();
-      if(mHazHint) mHazHint.textContent = isHaz ? "HAZ bleibt aktiv, bis ausgeglichen oder nicht mehr nötig." : "—";
+      if(mHazHint) mHazHint.textContent = isHaz ? "HAZ bleibt aktiv, bis ausgeglichen. Bei „nicht mehr nötig“ wird der Fall nicht in den aktiven Status übernommen." : "—";
       const changeReplacementField = mChangeReplacement?.closest?.(".field");
       if(changeReplacementField) changeReplacementField.classList.toggle("is-hidden", isHaz);
       const decisionBlock = mChangeDecision?.closest?.(".row-2");
@@ -2491,12 +2828,12 @@
       });
       if(mCustomerModeHint){
         mCustomerModeHint.textContent = mode === "existing"
-          ? "Bestehenden Dienst aus der Tages-CSV suchen und als bisherige Planung übernehmen."
-          : "Neuen Mitarbeiter aus der Mitarbeiterliste suchen. Tagesstatus wird angezeigt, falls vorhanden.";
+          ? "Bestehenden Dienst aus der Tages-CSV suchen und bei Bedarf mutieren."
+          : "Mitarbeiter neu auswählen; ein bestehender Dienst ist nicht erforderlich.";
       }
       const pickBtn = box.querySelector("#mPickMainStaff");
       if(pickBtn && (mTyp?.value === "anfrage_kunde" || mTyp?.value === "neuer_ma_geplant")){
-        pickBtn.textContent = mode === "existing" ? "Dienst / Mitarbeiter aus Tagesliste wählen" : "Mitarbeiter aus Mitarbeiterliste wählen";
+        pickBtn.textContent = mode === "existing" ? "Bestehenden Dienst suchen" : "Mitarbeiter neu auswählen";
       }
     }
 
@@ -2551,6 +2888,11 @@
       const zeit = fmtTimeRange(planHit);
       const ort = planHit.ort || "";
       if(mDienst) mDienst.value = dienst;
+      if(mSchichtBez) mSchichtBez.value = dienst;
+      if(mDienstAnfang && planHit.start instanceof Date) mDienstAnfang.value = planHit.start.toLocaleTimeString("de-CH",{hour:"2-digit",minute:"2-digit"});
+      if(mDienstende && planHit.end instanceof Date) mDienstende.value = planHit.end.toLocaleTimeString("de-CH",{hour:"2-digit",minute:"2-digit"});
+      if(mAnfangsort && !mAnfangsort.value) mAnfangsort.value = ort;
+      if(mEndort && !mEndort.value) mEndort.value = ort;
       if(mZeit) mZeit.value = zeit;
       if(mVonNach) mVonNach.value = ort;
       if(mBisherigePlanung) mBisherigePlanung.value = [dienst, zeit, ort].filter(Boolean).join(" · ");
@@ -2570,8 +2912,11 @@
       const dienst = (mDienst?.value || t.details?.dienst || displayAuftrag({auftrag:t.dienst}) || "").trim();
       if(typ === "krankmeldung" && name){
         mTitle.value = `Krankmeldung – ${name}${dienst ? " – " + dienst : ""}`;
-      } else if((typ === "dienstaenderung" || typ === "haz") && name){
-        const sub = (typ === "haz" || mChangeSubtype?.value === "haz") ? "HAZ" : "Dienständerung";
+      } else if(typ === "dienstaenderung"){
+        const datum = (mDatum?.value || planDateSide?.value || "Datum").trim();
+        mTitle.value = `${name || "Mitarbeiter"} - ${datum} - Dienstwechsel`;
+      } else if(typ === "haz" && name){
+        const sub = "HAZ";
         mTitle.value = `${sub} – ${name}${dienst ? " – " + dienst : ""}`;
       } else if(typ === "ereignis_kunde" && name){
         mTitle.value = `Ereignis – ${name}${dienst ? " – " + dienst : ""}`;
@@ -2579,6 +2924,8 @@
         mTitle.value = `Meldeformular${mMeldeZug?.value ? " – " + mMeldeZug.value : ""}`;
       } else if(typ === "zugmeldung_tanklager"){
         mTitle.value = `RCCH Zugmeldung Tanklager${mTankZugnummer?.value ? " – " + mTankZugnummer.value : ""}`;
+      } else if(typ === "notiz"){
+        mTitle.value = "";
       }
     }
 
@@ -2870,6 +3217,8 @@
     mTyp.addEventListener("change", ()=>{ updateDetailSections(); updateKrankHinweis(); updateHazUi(); autoTitleForType(); updateCustomerModeUi(); });
     mMeldeArt?.addEventListener("change", updateMeldeformularUi);
     mChangeSubtype?.addEventListener("change", ()=>{ updateDetailSections(); updateHazUi(); autoTitleForType(); });
+    [mDatum,mChangeOldDienst,mChangeNewDienst].forEach(el=>el?.addEventListener("input", ()=>{ if(mTyp?.value === "dienstaenderung") autoTitleForType(); }));
+    [mDatum].forEach(el=>el?.addEventListener("change", ()=>{ if(mTyp?.value === "dienstaenderung") autoTitleForType(); }));
     box.querySelector("#mPickEventStaff")?.addEventListener("click", takeEventStaffFromSufu);
     box.querySelector("#mPickMainStaff")?.addEventListener("click", takeMainStaffFromSufu);
     [mKrankVon,mKrankBis].forEach(el=>el?.addEventListener("change", ()=>{ updateKrankHinweis(); renderSickDuties(); }));
@@ -2883,6 +3232,7 @@
     updateHazUi();
     updateCustomerModeUi();
     updateMeldeformularUi();
+    syncCustomerFields();
 
     function applyToTask(){
       t.shift = mShift.value;
@@ -2891,14 +3241,22 @@
       t.typ = mTyp.value;
       t.typLabel = (TYPEN.find(x=>x.key===t.typ)||{}).label || t.typ;
       if(t.typ === "haz"){ t.typLabel = "HAZ / Heisse Überzeit"; if(mChangeSubtype) mChangeSubtype.value = "haz"; }
-      t.incidentId = (mIncident.value||"").trim();
-      t.titel = (mTitle.value||"").trim();
-      t.zug = (mZug.value||"").trim();
+      syncCustomerFields();
+      t.incidentId = (mIncident?.value||"").trim();
+      t.titel = (mTitle?.value||"").trim();
+      t.zug = (mZug?.value||mZugnummern?.value||"").trim();
       t.ort = (mOrt.value||"").trim();
       t.dienst = (mDienst?.value||"").trim();
       t.details = {
         customerMode: (mCustomerModeValue?.value||"").trim(),
-        dienst: (mDienst?.value||"").trim(),
+        schichtBezeichnung: (mSchichtBez?.value||"").trim(),
+        dienstAnfang: (mDienstAnfang?.value||"").trim(),
+        anfangsort: (mAnfangsort?.value||"").trim(),
+        zugnummern: (mZugnummern?.value||mZug?.value||"").trim(),
+        zugziel: (mZugziel?.value||"").trim(),
+        dienstende: (mDienstende?.value||"").trim(),
+        endort: (mEndort?.value||"").trim(),
+        dienst: (mDienst?.value||mSchichtBez?.value||"").trim(),
         datum: (mDatum?.value||"").trim(),
         planungQuelle: (mPlanQuelle?.value||"").trim(),
         zeit: (mZeit?.value||"").trim(),
@@ -2979,6 +3337,9 @@
         t.zug = t.details.tankZugnummer || t.zug;
         t.ort = t.details.tankOrt || t.ort;
         t.dienst = t.details.tankSpez || t.dienst;
+      }
+      if(t.typ === "dienstaenderung"){
+        t.titel = changeTaskTitle(t);
       }
       t.notiz = (mNotiz.value||"").trim();
       if(t.typ === "meldeformular" && !t.notiz) t.notiz = t.details.meldeBem || "";
@@ -3070,41 +3431,78 @@
 
     box.querySelector("#mPrepareRequest")?.addEventListener("click", ()=>{
       applyToTask();
+      if(t.typ === "dienstaenderung"){
+        if(isNew && !state.tasks.some(x=>x.id===t.id)){
+          if(!addOrUpdateTask(t, true)) return;
+        }
+        createReplacementFromChange(t);
+        return;
+      }
+      addSelectedStaffAsRequest(t);
       const d = t.details || {};
-      const req = (t.requests || []).find(r=>r.status && r.status !== REQ_STATUS.nicht_noetig) || (t.requests||[])[0];
+      const req = (t.requests || []).find(r=>r.status && r.status !== REQ_STATUS.nichtNoetig) || (t.requests||[])[0];
       if(!req && !d.mitarbeiterName){
-        setAskStatus("Bitte zuerst Mitarbeiter übernehmen.", "warn");
+        setAskStatus("Bitte zuerst Mitarbeiter auswählen.", "warn");
         return;
       }
       const to = (req?.mail || d.mitarbeiterMail || "").trim();
       const name = req?.name || d.mitarbeiterName || "";
-      const subject = `Anfrage Dienst ${d.dienst || t.dienst || ""}`.trim();
+      const vorname = firstNameFromDisplayName(name);
+      const subject = `Dienstanfrage ${d.datum || ""} ${d.schichtBezeichnung || d.dienst || t.dienst || ""}`.trim();
       const body = [
-        `Hallo ${name ? name.split(" ")[0] : ""}`,
+        `Hallo ${vorname || ""}`.trim(),
         "",
-        "wir haben eine Kundenanfrage erhalten:",
+        "wir haben eine Kundenanfrage für folgenden Dienst erhalten:",
         "",
-        `Bisherige Planung: ${d.bisherigePlanung || d.mitarbeiterDienstInfo || "—"}`,
-        `Neue Anfrage / Dienst: ${d.dienst || t.dienst || "—"}`,
         `Datum: ${d.datum || "—"}`,
-        `Zeit: ${d.zeit || "—"}`,
-        `Relation / Ort: ${d.vonNach || t.ort || "—"}`,
-        t.zug ? `Zug: ${t.zug}` : "",
+        `Schichtbezeichnung: ${d.schichtBezeichnung || d.dienst || "—"}`,
+        `Dienstbeginn: ${d.dienstAnfang || "—"} Uhr${d.anfangsort ? " ab " + d.anfangsort : ""}`,
+        d.zugnummern ? `Zugnummer(n): ${d.zugnummern}` : "",
+        d.zugziel ? `Zugziel: ${d.zugziel}` : "",
+        `Dienstende: ${d.dienstende || "—"}${d.endort ? " in " + d.endort : ""}`,
+        t.ort ? `Relation: ${t.ort}` : "",
+        d.bisherigePlanung ? `Zusatzinfo: ${d.bisherigePlanung}` : "",
+        t.notiz ? `Notiz: ${t.notiz}` : "",
         "",
-        "Bitte gib kurz Rückmeldung, ob du den Dienst übernehmen kannst.",
+        "Kannst du diesen Dienst übernehmen? Bitte gib uns kurz Rückmeldung mit Ja oder Nein.",
         "",
-        "Freundliche Grüsse",
+        "Vielen Dank und freundliche Grüsse",
         "Dispo / Besno"
       ].filter(Boolean).join("\n");
-      setAskStatus("✓ Anfrage vorbereitet. Mailprogramm wird geöffnet.");
+      saveState();
+      setAskStatus("✓ Mail vorbereitet. Mailprogramm wird geöffnet.");
       window.location.href = `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
     });
 
-    box.querySelector("#mReply").onclick = ()=>{ applyToTask(); openReplyModal(t); };
+    box.querySelector("#mReply")?.addEventListener("click", ()=>{
+      applyToTask();
+      if(t.typ === "dienstaenderung" || t.typ === "haz" || t.details?.changeSubtype === "haz"){
+        if(isNew && !state.tasks.some(x=>x.id===t.id)){
+          if(!addOrUpdateTask(t, true)) return;
+        }
+        prepareChangeResponseMail(t);
+        safeRender();
+        return;
+      }
+      openReplyModal(t);
+    });
 
     box.querySelector("#mSave").onclick = ()=>{
       applyToTask();
-      if(!t.titel){ alert("Titel ist Pflicht."); return; }
+      if(t.typ === "anfrage_kunde" || t.typ === "neuer_ma_geplant") addSelectedStaffAsRequest(t);
+      if((t.typ === "haz" || t.details?.changeSubtype === "haz") && t.details?.hazStatus === "nicht_noetig"){
+        if(!isNew){
+          t.done = true;
+          t.archived = true;
+          t.updatedAt = nowIso();
+          saveState();
+        }
+        ov.remove();
+        safeRender();
+        return;
+      }
+      if(t.typ === "notiz") t.titel = "";
+      if(t.typ !== "notiz" && !t.titel){ alert("Titel ist Pflicht."); return; }
       if(!addOrUpdateTask(t, isNew)) return;
       saveState();
       ov.remove();
@@ -3532,6 +3930,8 @@
       role: roleSel?.value || "Dispo",
       shift: state.ui?.shift || "Früh",
       latestHandover: latestHandover || null,
+      sharePointListTasks: sharePointListTasks(),
+      allVorgangData: exportAllVorgangData(),
       state: state
     };
   }
@@ -3570,6 +3970,120 @@
     return result;
   }
 
+  function eventItemClosed(item){
+    const raw = String(item?.status || item?.Status || item?.state || item?.abschlussStatus || item?.AbschlussStatus || "").toLowerCase();
+    return !!(item?.abgeschlossen || item?.closed || item?.done || raw.includes("abgeschlossen") || raw.includes("erledigt") || raw.includes("closed"));
+  }
+
+  function eventItemKey(item){
+    return String(item?.aufgabeId || item?.taskId || item?.id || item?.ID || item?.eventTaskId || item?.ereignisAufgabeId || item?.ereignisId || item?.eventId || "").trim();
+  }
+
+  function flattenEventFlowItems(result){
+    let data = result?.daten ?? result?.items ?? result?.tasks ?? result?.value ?? result;
+    if(typeof data === "string"){
+      try{ data = JSON.parse(data); }catch(_){ data = []; }
+    }
+    if(Array.isArray(data)) return data;
+    const direct = data?.eventTasks || data?.aufgaben || data?.tasks || data?.items || data?.value || [];
+    if(Array.isArray(direct)) return direct;
+    return [];
+  }
+
+  function eventFollowUpToTask(item){
+    const key = eventItemKey(item) || uid();
+    const eventId = String(item?.ereignisId || item?.eventId || item?.EreignisID || item?.incidentId || "").trim();
+    const closed = eventItemClosed(item);
+    const title = item?.titel || item?.title || item?.aufgabe || item?.taskTitle || item?.bezeichnung || (eventId ? `Aufgabe aus Ereignis ${eventId}` : "Aufgabe aus Ereignis");
+    const now = nowIso();
+    const created = item?.createdAt || item?.erstelltAm || item?.Created || now;
+    const updated = item?.updatedAt || item?.geaendertAm || item?.Modified || now;
+    const t = {
+      id: "EVT_" + String(key).replace(/[^a-zA-Z0-9_\-]/g,"_").slice(0,48),
+      internalVorgangId: "",
+      createdAt: created,
+      updatedAt: updated,
+      shift: state.ui?.shift || "Tag",
+      kundeEvuId: item?.kundeEvuId || item?.evu || item?.EVU || "",
+      kundeLabel: item?.kundeLabel || item?.kunde || item?.Kunde || "",
+      typ: "ereignis_aufgabe",
+      typLabel: "Aufgabe aus Ereignis",
+      titel: String(title || "Aufgabe aus Ereignis"),
+      zug: item?.zug || item?.zugnummer || item?.Zugnummer || "",
+      dienst: item?.dienst || item?.Dienst || "",
+      ort: item?.ort || item?.relation || item?.Ort || "",
+      incidentId: eventId,
+      notiz: item?.notiz || item?.bemerkung || item?.beschreibung || item?.Beschreibung || "",
+      requests: [],
+      details: {
+        source: "Ereignisliste SharePoint",
+        eventId,
+        eventTaskId: key,
+        eventStatus: item?.status || item?.Status || "",
+        eventTaskClosed: closed,
+        eventStatusClosed: closed,
+        originalEventItem: item
+      },
+      done: closed,
+      archived: false
+    };
+    ensureInternalVorgangId(t);
+    return t;
+  }
+
+  function mergeEventFollowUpTasks(items){
+    let created = 0, updated = 0, closed = 0;
+    (items || []).forEach(item=>{
+      const nt = eventFollowUpToTask(item);
+      const key = nt.details.eventTaskId || nt.incidentId || nt.id;
+      const existing = (state.tasks || []).find(t =>
+        t.typ === "ereignis_aufgabe" && (
+          t.details?.eventTaskId === key ||
+          (nt.incidentId && t.details?.eventId === nt.incidentId && t.titel === nt.titel) ||
+          t.id === nt.id
+        )
+      );
+      if(existing){
+        existing.titel = nt.titel || existing.titel;
+        existing.kundeEvuId = nt.kundeEvuId || existing.kundeEvuId;
+        existing.kundeLabel = nt.kundeLabel || existing.kundeLabel;
+        existing.zug = nt.zug || existing.zug;
+        existing.dienst = nt.dienst || existing.dienst;
+        existing.ort = nt.ort || existing.ort;
+        existing.incidentId = nt.incidentId || existing.incidentId;
+        existing.notiz = nt.notiz || existing.notiz;
+        existing.details = {...(existing.details || {}), ...(nt.details || {})};
+        existing.done = !!nt.done;
+        existing.updatedAt = nowIso();
+        ensureInternalVorgangId(existing);
+        updated++;
+        if(existing.done) closed++;
+      }else{
+        state.tasks.unshift(nt);
+        created++;
+        if(nt.done) closed++;
+      }
+    });
+    return { created, updated, closed, total:(items || []).length };
+  }
+
+  async function loadEventFollowUpsFromSharePoint(){
+    if(!EVENTS_FLOW_ENABLED){
+      return { skipped:true, message:"Ereignis-Flow noch nicht konfiguriert." };
+    }
+    const response = await fetch(LOAD_EVENTS_FLOW_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ aktion:"loadEventFollowUps", quelle:"dienstuebergabe" })
+    });
+    const result = await response.json();
+    if(!response.ok || result?.success === false){
+      throw new Error(result?.message || `Ereignis-Flow Antwort: HTTP ${response.status}`);
+    }
+    const items = flattenEventFlowItems(result);
+    return mergeEventFollowUpTasks(items);
+  }
+
   async function loadLatestFromSharePoint(){
     if(!LOAD_FLOW_URL || LOAD_FLOW_URL.includes("HIER_DEINE")){
       alert("LOAD_FLOW_URL ist noch nicht eingetragen. Bitte zuerst den Laden-Flow erstellen und die URL im HTML eintragen.");
@@ -3602,11 +4116,21 @@
     remoteState.ui.listFilter = "aktiv";
     remoteState.ui.evu = "__ALL__";
     state = remoteState;
+    let eventInfo = null;
+    try{
+      eventInfo = await loadEventFollowUpsFromSharePoint();
+    }catch(evErr){
+      eventInfo = { error: evErr?.message || String(evErr) };
+    }
     saveState();
     if(handoverSummary) handoverSummary.value = state.handovers?.[0]?.summary || "";
     if(handoverNotes) handoverNotes.value = state.handovers?.[0]?.notes || "";
     safeRender();
-    setCloudStatus(`Letzte Übergabe aus SharePoint geladen${result.gespeichertAm ? ": " + fmtTs(result.gespeichertAm) : ""}.`, "ok");
+    let msg = `Letzte Übergabe aus SharePoint geladen${result.gespeichertAm ? ": " + fmtTs(result.gespeichertAm) : ""}.`;
+    if(eventInfo?.error) msg += ` Ereignisliste konnte nicht geladen werden: ${eventInfo.error}`;
+    else if(eventInfo?.skipped) msg += " Ereignis-Flow noch nicht konfiguriert.";
+    else if(eventInfo) msg += ` Ereignis-Aufgaben: ${eventInfo.created} neu, ${eventInfo.updated} aktualisiert, ${eventInfo.closed} abgeschlossen.`;
+    setCloudStatus(msg, eventInfo?.error ? "warn" : "ok");
   }
 
   btnSaveHandover.addEventListener("click", async ()=>{
@@ -3652,153 +4176,88 @@
     const now = new Date();
     const role = roleSel.value || "Dispo";
     const shift = state.ui.shift || "Früh";
-    const openTasks = (state.tasks || [])
-      .filter(t => !t.done)
-      .map(t => ({...t, statusGesamt: computeOverallStatus(t)}))
-      .sort((a,b)=>{
-        const rank = (s)=> s===OVERALL.eskalation ? 0 : s===OVERALL.wartend ? 1 : s===OVERALL.angenommen ? 2 : 3;
-        const r = rank(a.statusGesamt) - rank(b.statusGesamt);
-        if(r) return r;
-        return new Date(b.updatedAt||b.createdAt) - new Date(a.updatedAt||a.createdAt);
-      });
-
-    const current = (PLAN || []).filter(p => !isOfficeDienst(p) && p.start <= now && p.end >= now);
-    const soon = (PLAN || []).filter(p => !isOfficeDienst(p) && p.start > now && p.start <= new Date(now.getTime()+3*60*60*1000));
-    const changes = (PLAN || []).map(p=>({p, ui: STAFF_UI[staffKey(p)]})).filter(x => x.ui && (x.ui.note || x.ui.change || x.ui.hidden));
-
+    const operator = operatorDisplayText() || "nicht gesetzt";
     const summary = (handoverSummary.value || "").trim() || buildAutoSummary(state.tasks || []);
     const notes = (handoverNotes.value || "").trim();
 
-    const rowsTasks = openTasks.length ? openTasks.map(t=>`
-      <tr>
-        <td>${escapeHtml(t.statusGesamt)}</td>
-        <td>${escapeHtml(t.kundeEvuId || t.kundeLabel || "—")}</td>
-        <td>${escapeHtml(t.shift || "—")}</td>
-        <td>${escapeHtml(t.titel || "(ohne Titel)")}</td>
-        <td>${escapeHtml(reqSummary(t))}</td>
-        <td>${escapeHtml(fmtTs(t.updatedAt || t.createdAt))}</td>
-      </tr>`).join("") : `<tr><td colspan="6">Keine offenen Vorgänge.</td></tr>`;
+    const reportTasks = (state.tasks || [])
+      .filter(t => t.typ !== "ereignis_kunde" && t.typ !== "ereignis")
+      .map(t => ({...t, statusGesamt: computeOverallStatus(t)}));
 
-    const rowsCurrent = current.length ? current.map(p=>`
-      <tr><td>${escapeHtml(p.name)}</td><td>${escapeHtml(p.start.toLocaleTimeString("de-CH",{hour:"2-digit",minute:"2-digit"}) )}–${escapeHtml(p.end.toLocaleTimeString("de-CH",{hour:"2-digit",minute:"2-digit"}) )}</td><td>${escapeHtml(p.ort || "—")}</td><td>${escapeHtml(displayAuftrag(p) || "—")}</td></tr>`).join("") : `<tr><td colspan="4">Keine Mitarbeitenden aktuell im Dienst oder kein Dienstplan geladen.</td></tr>`;
+    const rank = (s)=> s===OVERALL.eskalation ? 0 : s===OVERALL.wartend ? 1 : s===OVERALL.angenommen ? 2 : s===OVERALL.offen ? 3 : 4;
+    const sortTasks = (arr)=>arr.sort((a,b)=>{
+      const r = rank(a.statusGesamt) - rank(b.statusGesamt);
+      if(r) return r;
+      return new Date(b.updatedAt||b.createdAt) - new Date(a.updatedAt||a.createdAt);
+    });
 
-    const rowsSoon = soon.length ? soon.map(p=>`
-      <tr><td>${escapeHtml(p.name)}</td><td>${escapeHtml(p.start.toLocaleTimeString("de-CH",{hour:"2-digit",minute:"2-digit"}) )}–${escapeHtml(p.end.toLocaleTimeString("de-CH",{hour:"2-digit",minute:"2-digit"}) )}</td><td>${escapeHtml(p.ort || "—")}</td><td>${escapeHtml(displayAuftrag(p) || "—")}</td></tr>`).join("") : `<tr><td colspan="4">Keine Dienstbeginne in den nächsten 3 Stunden.</td></tr>`;
+    // Schichtrapport bewusst ohne Dienstplan-Anzeige.
+    // Gewünscht sind nur Erfassung sowie Vorgänge: offen, bearbeitet, abgeschlossen.
+    const offeneVorgaenge = sortTasks(reportTasks.filter(t => !t.done && !t.archived && t.statusGesamt === OVERALL.offen));
+    const bearbeiteteVorgaenge = sortTasks(reportTasks.filter(t => !t.done && !t.archived && t.statusGesamt !== OVERALL.offen));
+    const abgeschlosseneVorgaenge = sortTasks(reportTasks.filter(t => !!t.done && !t.archived));
 
-    const rowsChanges = changes.length ? changes.map(x=>`
-      <tr><td>${escapeHtml(x.p.name)}</td><td>${escapeHtml(x.ui.change || "—")}</td><td>${escapeHtml(x.ui.note || "—")}</td><td>${x.ui.hidden ? "ausgeblendet" : "aktiv"}</td></tr>`).join("") : `<tr><td colspan="4">Keine Dienständerungen oder Notizen erfasst.</td></tr>`;
+    function typText(t){ return t.typLabel || t.typ || "Vorgang"; }
+    function vorgangIdText(t){ return t.internalVorgangId || t.id || "—"; }
+    function taskRows(arr, emptyText){
+      if(!arr.length) return `<tr><td colspan="8">${escapeHtml(emptyText)}</td></tr>`;
+      return arr.map(t=>`
+        <tr>
+          <td>${escapeHtml(vorgangIdText(t))}</td>
+          <td>${escapeHtml(typText(t))}</td>
+          <td>${escapeHtml(t.statusGesamt || "—")}</td>
+          <td>${escapeHtml(t.kundeEvuId || t.kundeLabel || "—")}</td>
+          <td>${escapeHtml(t.titel || "(ohne Titel)")}</td>
+          <td>${escapeHtml(t.zug || t.dienst || t.details?.dienst || "—")}</td>
+          <td>${escapeHtml(t.ort || t.details?.vonNach || "—")}</td>
+          <td>${escapeHtml(fmtTs(t.updatedAt || t.createdAt))}</td>
+        </tr>`).join("");
+    }
 
     return `<!doctype html><html lang="de"><head><meta charset="utf-8"><title>Schichtrapport ${escapeHtml(shift)} ${escapeHtml(role)}</title>
       <style>
-        body{font-family:Arial,sans-serif;margin:28px;color:#111} h1{font-size:22px;margin:0 0 4px} h2{font-size:16px;margin:24px 0 8px;border-bottom:2px solid #e53935;padding-bottom:4px}
-        .meta{font-size:12px;color:#555;margin-bottom:18px}.box{border:1px solid #ddd;border-radius:8px;padding:12px;white-space:pre-wrap;background:#fafafa}
-        table{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px} th,td{border:1px solid #ddd;padding:6px;text-align:left;vertical-align:top} th{background:#f0f0f0}
-        .actions{margin:16px 0 22px}.actions button{padding:10px 14px;font-weight:900}.footer{margin-top:24px;font-size:11px;color:#666}
+        body{font-family:Arial,sans-serif;margin:28px;color:#111}
+        h1{font-size:22px;margin:0 0 4px}
+        h2{font-size:16px;margin:24px 0 8px;border-bottom:2px solid #e53935;padding-bottom:4px}
+        .meta{font-size:12px;color:#555;margin-bottom:18px;line-height:1.45}
+        .box{border:1px solid #ddd;border-radius:8px;padding:12px;white-space:pre-wrap;background:#fafafa}
+        table{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
+        th,td{border:1px solid #ddd;padding:6px;text-align:left;vertical-align:top}
+        th{background:#f0f0f0}
+        .actions{margin:16px 0 22px}.actions button{padding:10px 14px;font-weight:900}
+        .footer{margin-top:24px;font-size:11px;color:#666}
         @media print{.actions{display:none} body{margin:12mm}}
-      
-
-/* ===== V7.11 Test: intuitivere Vorgangskarten ===== */
-.taskCard{
-  display:grid !important;
-  grid-template-columns: 10px minmax(0,1fr) 250px !important;
-  gap:0 !important;
-  padding:0 !important;
-  overflow:hidden;
-  border:1px solid #ddd;
-  border-radius:14px;
-  background:#fff;
-  box-shadow:0 1px 5px rgba(0,0,0,.06);
-  align-items:stretch !important;
-}
-.taskBand{width:10px;background:#999;}
-.taskBand.eskalation{background:#e53935;}
-.taskBand.wartend{background:#f5c000;}
-.taskBand.angenommen{background:#1e88e5;}
-.taskBand.offen{background:#999;}
-.taskMain{padding:14px 16px;min-width:0;}
-.taskHead{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;}
-.taskTitle{font-size:17px;font-weight:900;line-height:1.25;margin-bottom:4px;}
-.taskSub{font-size:13px;color:#555;line-height:1.35;}
-.taskMetaGrid{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px;margin-top:12px;}
-.taskMetaBox{background:#f7f7f7;border-radius:10px;padding:9px;min-height:42px;}
-.taskMetaLabel{font-size:11px;color:#666;font-weight:900;text-transform:uppercase;letter-spacing:.02em;margin-bottom:3px;}
-.taskMetaValue{font-size:13px;font-weight:800;word-break:break-word;}
-.taskNote{margin-top:10px;background:#fff8e1;border-left:4px solid #f5c000;padding:8px;border-radius:6px;font-size:13px;}
-.taskHistoryMini{margin-top:10px;font-size:12px;color:#666;}
-.taskActionsPanel{padding:14px;background:#fafafa;border-left:1px solid #e5e5e5;display:flex;flex-direction:column;gap:8px;justify-content:center;}
-.taskActionsPanel button{width:100%;}
-.taskMore{margin-top:4px;}
-.taskMore summary{cursor:pointer;font-size:12px;font-weight:900;color:#555;text-align:center;padding:6px;border-radius:6px;background:#eee;}
-.taskMoreInner{display:flex;flex-direction:column;gap:8px;margin-top:8px;}
-.taskPrimaryStatus{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
-.taskUrgentHint{font-size:12px;font-weight:900;color:#b00020;margin-top:6px;}
-@media (max-width:1100px){
-  .taskCard{grid-template-columns:8px 1fr !important;}
-  .taskActionsPanel{grid-column:2;border-left:0;border-top:1px solid #e5e5e5;}
-  .taskMetaGrid{grid-template-columns:1fr 1fr;}
-}
-@media (max-width:650px){.taskMetaGrid{grid-template-columns:1fr;}}
-
-
-
-/* ===== V7.12 Filter kompakt + breitere EVU-Kacheln ===== */
-.filterDetails{margin-top:18px;background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e5e5e5}
-.filterDetails summary{background:#e53935;color:#fff;font-weight:900;text-align:center;font-size:20px;padding:12px;cursor:pointer;list-style:none}
-.filterDetails summary::-webkit-details-marker{display:none}
-.filterContent{padding:12px;background:#fff}
-.filterRow{display:grid;grid-template-columns:280px minmax(420px,1fr);gap:14px;margin:12px 0;align-items:start}
-.filterSearch{grid-column:1 / -1}
-@media (max-width: 1100px){.filterRow{grid-template-columns:1fr}}
-#evuPillars{grid-template-columns:repeat(auto-fit,minmax(230px,1fr)) !important}
-.taskChangeCard{border-left:8px solid #f5c000}
-.taskChangeCard .taskTitle{color:#5f4200}
-.taskChangeCard.isClosedChange{opacity:.8}
-.modalSubsection{border:1px solid #e0e0e0;border-radius:10px;padding:12px;margin:12px 0;background:#fbfbfb}
-.modalSubsection h3{margin:0 0 10px 0;font-size:15px}
-
-
-/* ===== V7.23 intuitive Workflow-Ergänzungen ===== */
-.typeBadge{display:inline-block;padding:4px 10px;border-radius:999px;background:#eef2ff;border:1px solid #4d73ff;font-size:12px;font-weight:900;margin-right:6px}
-.typeBadge.haz{background:#fff8e1;border-color:#f5c000}
-.typeBadge.ereignis{background:#ffe8e8;border-color:#e53935}
-.typeBadge.krank{background:#fff3e0;border-color:#fb8c00}
-.duplicateHint{background:#fff8e1;border:2px solid #f5c000;border-radius:10px;padding:10px;margin:10px 0;font-weight:800}
-.quickDecision{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
-.taskDue{font-size:12px;font-weight:900;color:#b00020;margin-top:4px}
-.taskCard[data-typ="haz"] .taskBand{background:#f5c000}
-.taskCard[data-typ="ereignis_kunde"] .taskBand{background:#e53935}
-.taskCard[data-typ="krankmeldung"] .taskBand{background:#fb8c00}
-
-<\/style>
-<style>
-/* ===== V7.24 intuitive Struktur ===== */
-.v724-typeGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-top:12px}
-.v724-typeCard{border:1px solid #ddd;background:#fff;border-radius:12px;padding:14px;text-align:left;cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,.06)}
-.v724-typeCard:hover{background:#eef5ff;border-color:#1e88e5}
-.v724-typeTitle{font-weight:900;font-size:16px;margin-bottom:6px}
-.v724-typeHint{font-size:12px;color:#555;line-height:1.35}
-.taskHistoryMini{font-size:12px;color:#555;margin-top:8px;background:#f7f7f7;border-left:4px solid #bbb;padding:6px;border-radius:6px}
-.taskHistoryMini b{color:#333}
-.taskConflictBox{border:2px solid #e53935;background:#fff3f3;border-radius:10px;padding:10px;margin:10px 0;font-weight:800}
-.taskGroup.byType .taskGroupHeader{background:#eef2ff}
-.taskGroup.byType.haz .taskGroupHeader{background:#fff8e1}
-.taskGroup.byType.event .taskGroupHeader{background:#ffe8e8}
-.taskGroup.byType.krank .taskGroupHeader{background:#fff2df}
-.staffMeta .poolBadge{max-width:100%}
-<\/style>
-
-<\/head><body>
+      </style>
+      </head><body>
       <div class="actions"><button onclick="window.print()">Drucken / als PDF speichern</button></div>
       <h1>Schichtrapport Dienstübergabe</h1>
-      <div class="meta">Rolle: ${escapeHtml(role)} · Schicht: ${escapeHtml(shift)} · Erstellt: ${escapeHtml(now.toLocaleString("de-CH"))}</div>
+      <div class="meta">
+        Rolle: ${escapeHtml(role)} · Schicht: ${escapeHtml(shift)} · Bearbeitung: ${escapeHtml(operator)} · Erstellt: ${escapeHtml(now.toLocaleString("de-CH"))}<br>
+        Inhalt: Erfassung sowie Vorgänge offen, bearbeitet und abgeschlossen. Dienstplananzeigen sind bewusst nicht enthalten.
+      </div>
+
+      <h2>Erfassung</h2>
+      <table><tbody>
+        <tr><th>Rolle</th><td>${escapeHtml(role)}</td></tr>
+        <tr><th>Schicht</th><td>${escapeHtml(shift)}</td></tr>
+        <tr><th>Bearbeitung</th><td>${escapeHtml(operator)}</td></tr>
+        <tr><th>Erstellt</th><td>${escapeHtml(now.toLocaleString("de-CH"))}</td></tr>
+      </tbody></table>
+
       <h2>Kurzlage</h2><div class="box">${escapeHtml(summary || "—")}</div>
       <h2>Notizen</h2><div class="box">${escapeHtml(notes || "—")}</div>
-      <h2>Offene Vorgänge / Statusliste</h2><table><thead><tr><th>Status</th><th>Kunde/EVU</th><th>Schicht</th><th>Vorgang</th><th>Anfragen</th><th>Update</th></tr></thead><tbody>${rowsTasks}</tbody></table>
-      <h2>Aktuell im Dienst</h2><table><thead><tr><th>Name</th><th>Zeit</th><th>Ort</th><th>Dienst</th></tr></thead><tbody>${rowsCurrent}</tbody></table>
-      <h2>Beginn in den nächsten 3 Stunden</h2><table><thead><tr><th>Name</th><th>Zeit</th><th>Ort</th><th>Dienst</th></tr></thead><tbody>${rowsSoon}</tbody></table>
-      <h2>Dienständerungen / Notizen / ausgeblendete Dienste</h2><table><thead><tr><th>Name</th><th>Dienständerung</th><th>Notiz</th><th>Status</th></tr></thead><tbody>${rowsChanges}</tbody></table>
-      <div class="footer">Testausgabe lokal aus der Dienstübergabe. Später kann derselbe Datensatz in SharePoint/Bibliothek gespeichert werden.</div>
-      <\/body><\/html>`;
+
+      <h2>Vorgänge offen</h2>
+      <table><thead><tr><th>ID</th><th>Typ</th><th>Status</th><th>Kunde/EVU</th><th>Vorgang</th><th>Dienst/Zug</th><th>Ort/Relation</th><th>Letzte Änderung</th></tr></thead><tbody>${taskRows(offeneVorgaenge, "Keine offenen Vorgänge.")}</tbody></table>
+
+      <h2>Vorgänge bearbeitet / in Abklärung</h2>
+      <table><thead><tr><th>ID</th><th>Typ</th><th>Status</th><th>Kunde/EVU</th><th>Vorgang</th><th>Dienst/Zug</th><th>Ort/Relation</th><th>Letzte Änderung</th></tr></thead><tbody>${taskRows(bearbeiteteVorgaenge, "Keine bearbeiteten Vorgänge in Abklärung.")}</tbody></table>
+
+      <h2>Vorgänge abgeschlossen</h2>
+      <table><thead><tr><th>ID</th><th>Typ</th><th>Status</th><th>Kunde/EVU</th><th>Vorgang</th><th>Dienst/Zug</th><th>Ort/Relation</th><th>Letzte Änderung</th></tr></thead><tbody>${taskRows(abgeschlosseneVorgaenge, "Keine abgeschlossenen Vorgänge.")}</tbody></table>
+
+      <div class="footer">Schichtrapport aus der Dienstübergabe. Ereignisse werden nicht als Übergabe-Vorgang gelistet; die Ereignis-ID entsteht im Ereignisformular.</div>
+      </body></html>`;
   }
 
   if(btnShiftReport){
@@ -4052,7 +4511,8 @@ function detectDelimiter(lines){
 
   candidates.forEach(d=>{
     const real = d === "\\t" ? "\t" : d;
-    const count = (sample.match(new RegExp(real === "\t" ? "\\t" : "\\"+real, "g")) || []).length;
+    const escaped = real === "\t" ? "\\t" : real.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const count = (sample.match(new RegExp(escaped, "g")) || []).length;
     if(count > bestCount){
       bestCount = count;
       best = real;
@@ -4412,6 +4872,7 @@ function createTaskFromPlanPerson(p, subtype="diensttausch"){
   return {
     __isNew:true,
     id: uid(),
+    internalVorgangId: "",
     createdAt: nowIso(),
     updatedAt: nowIso(),
     shift: inferShiftFromPlan(p) || state.ui.shift || "",
@@ -4704,8 +5165,8 @@ function v724TypeMeta(typ){
     anfrage_kunde:{label:"Kundenanfrage", hint:"Kunde fragt Dienst/Leistung an, MA anfragen, Entscheid an Kunde."},
     krankmeldung:{label:"Krankmeldung", hint:"Mitarbeiter auswählen, Dienst aus Tagesplanung.csv, Ersatzplanung optional."},
     dienstaenderung:{label:"Dienständerung", hint:"Tausch, Frei, Schichtwechsel, Dienstzeit/AZG."},
-    haz:{label:"HAZ", hint:"Heisse Überzeit mit 72h-Frist beobachten/ausgleichen."},
-    ereignis_kunde:{label:"Ereignis", hint:"Minimal vorerfassen und Ereignismeldung öffnen."},
+    haz:{label:"HAZ", hint:"Heisse Überzeit mit 72h-Frist beobachten/ausgleichen; nicht nötig wird nicht in den aktiven Status übernommen."},
+    ereignis_kunde:{label:"Ereignis", hint:"Ereignis-HTML direkt öffnen."},
     notiz:{label:"Notiz", hint:"Kurzer Hinweis, nur bei Bedarf rapport-/statusrelevant."}
   };
   return map[typ] || {label:typ || "Vorgang", hint:""};
@@ -4914,6 +5375,15 @@ renderAll = function(){
   try{ saveState(); }catch(_){}
 };
 
+function openEreignisHtmlOnly(){
+  const params = new URLSearchParams();
+  params.set("quelle", "dienstuebergabe");
+  if(planDateSide?.value) params.set("datum", planDateSide.value);
+  if(roleSel?.value) params.set("rolle", roleSel.value);
+  if(state?.ui?.shift) params.set("schicht", state.ui.shift);
+  window.open("https://betriebsleitung-mev.github.io/Ereignisserfassung/?" + params.toString(), "_blank");
+}
+
 function v724OpenTypeChooser(){
   const ov = document.createElement("div");
   ov.className = "overlay";
@@ -4943,6 +5413,11 @@ function v724OpenTypeChooser(){
   box.querySelectorAll("[data-newtyp]").forEach(btn=>{
     btn.onclick = ()=>{
       const typ = btn.dataset.newtyp;
+      if(typ === "ereignis_kunde"){
+        ov.remove();
+        openEreignisHtmlOnly();
+        return;
+      }
       const meta = v724TypeMeta(typ);
       const t = {
         __isNew:true,
@@ -5021,6 +5496,10 @@ function v741CreateTaskByType(typ){
 
 function v741OpenTaskFromInlineType(typ){
   if(!typ) return;
+  if(typ === "ereignis_kunde"){
+    openEreignisHtmlOnly();
+    return;
+  }
   openTaskModal(v741CreateTaskByType(typ));
 }
 
@@ -5643,9 +6122,9 @@ async function v742AutoloadLocalFiles(){
       "Dienständerung":"Modification de service",
       "Tausch, Frei, Schichtwechsel, Dienstzeit/AZG.":"Échange, congé, changement d’équipe, horaire/LDT.",
       "HAZ":"HS / heures supplémentaires urgentes",
-      "Heisse Überzeit mit 72h-Frist beobachten/ausgleichen.":"Heures supplémentaires urgentes à suivre/compenser sous 72 h.",
+      "Heisse Überzeit mit 72h-Frist beobachten/ausgleichen; nicht nötig wird nicht in den aktiven Status übernommen.":"Heures supplémentaires urgentes à suivre/compenser sous 72 h.",
       "Ereignis":"Événement",
-      "Minimal vorerfassen und Ereignismeldung öffnen.":"Pré-saisir le minimum et ouvrir l’annonce d’événement.",
+      "Ereignis-HTML direkt öffnen.":"Pré-saisir le minimum et ouvrir l’annonce d’événement.",
       "Meldeformular":"Formulaire d’annonce",
       "Allgemeine Meldung für alle EVU: Lok, Betrieb, Infrastruktur, Papiere usw.":"Annonce générale pour toutes les EF : locomotive, exploitation, infrastructure, documents, etc.",
       "Zugmeldung RCCH":"Annonce de train RCCH",
@@ -5705,7 +6184,7 @@ async function v742AutoloadLocalFiles(){
       "offen":"ouvert",
       "Ersatzplanung starten":"Lancer remplacement",
       "nicht nötig":"pas nécessaire",
-      "Ersatzplanung für alle starten":"Lancer remplacement pour tous",
+      "Ersatzplanung für Dienste im Zeitraum starten":"Lancer remplacement pour les services de la période",
       "Gefundene Dienste im Krankheitszeitraum":"Services trouvés dans la période de maladie",
       "Meldeformular – schnelle Dispo-Meldung":"Formulaire d’annonce – saisie rapide Dispo",
       "Schnell erfassen":"Saisie rapide",
@@ -5736,8 +6215,8 @@ async function v742AutoloadLocalFiles(){
       "Grund":"Motif",
       "Schliessen":"Fermer",
       "Speichern":"Enregistrer",
-      "Mitarbeiter übernehmen":"Reprendre collaborateur",
-      "Anfrage vorbereiten":"Préparer demande",
+      "Mitarbeiter automatisch beim Speichern übernehmen":"Reprendre automatiquement à l’enregistrement",
+      "Mail vorbereiten":"Préparer e-mail",
       "Antworten":"Réponses"
     },
     it: {
@@ -5755,9 +6234,9 @@ async function v742AutoloadLocalFiles(){
       "Dienständerung":"Modifica del servizio",
       "Tausch, Frei, Schichtwechsel, Dienstzeit/AZG.":"Scambio, libero, cambio turno, orario/legge sul lavoro.",
       "HAZ":"HS / ore supplementari urgenti",
-      "Heisse Überzeit mit 72h-Frist beobachten/ausgleichen.":"Ore supplementari urgenti da monitorare/compensare entro 72 ore.",
+      "Heisse Überzeit mit 72h-Frist beobachten/ausgleichen; nicht nötig wird nicht in den aktiven Status übernommen.":"Ore supplementari urgenti da monitorare/compensare entro 72 ore.",
       "Ereignis":"Evento",
-      "Minimal vorerfassen und Ereignismeldung öffnen.":"Precompilare il minimo e aprire la segnalazione evento.",
+      "Ereignis-HTML direkt öffnen.":"Precompilare il minimo e aprire la segnalazione evento.",
       "Meldeformular":"Modulo di segnalazione",
       "Allgemeine Meldung für alle EVU: Lok, Betrieb, Infrastruktur, Papiere usw.":"Segnalazione generale per tutte le IF: locomotiva, esercizio, infrastruttura, documenti, ecc.",
       "Zugmeldung RCCH":"Comunicazione treno RCCH",
@@ -5817,7 +6296,7 @@ async function v742AutoloadLocalFiles(){
       "offen":"aperto",
       "Ersatzplanung starten":"Avvia sostituzione",
       "nicht nötig":"non necessario",
-      "Ersatzplanung für alle starten":"Avvia sostituzione per tutti",
+      "Ersatzplanung für Dienste im Zeitraum starten":"Avvia sostituzione per i servizi nel periodo",
       "Gefundene Dienste im Krankheitszeitraum":"Servizi trovati nel periodo di malattia",
       "Meldeformular – schnelle Dispo-Meldung":"Modulo di segnalazione – registrazione rapida Dispo",
       "Schnell erfassen":"Registrazione rapida",
@@ -5848,8 +6327,8 @@ async function v742AutoloadLocalFiles(){
       "Grund":"Motivo",
       "Schliessen":"Chiudi",
       "Speichern":"Salva",
-      "Mitarbeiter übernehmen":"Riprendi collaboratore",
-      "Anfrage vorbereiten":"Prepara richiesta",
+      "Mitarbeiter automatisch beim Speichern übernehmen":"Riprendi automaticamente al salvataggio",
+      "Mail vorbereiten":"Prepara e-mail",
       "Antworten":"Risposte"
     }
   };
