@@ -3880,47 +3880,35 @@
 
   // ===== Auto-Übergabe (V6.1) =====
   function buildAutoSummary(tasks){
+    const all = (tasks || [])
+      .filter(t => t.typ !== "ereignis_kunde" && t.typ !== "ereignis")
+      .map(t => ({...t, statusGesamt: computeOverallStatus(t)}));
 
-  const lines = [];
-
-  lines.push("Bearbeitung:");
-  lines.push(`• ${roleSel.value || "Dispo"}: ${operatorDisplayText() || "nicht gesetzt"}`);
-  lines.push("");
-  lines.push("Offene Vorgänge:");
-
-  (tasks||[])
-    .filter(t => !t.done)
-    .sort((a,b)=> new Date(b.updatedAt||b.createdAt) - new Date(a.updatedAt||a.createdAt))
-    .slice(0,5)
-    .forEach(t=>{
-      lines.push(`• ${t.kundeEvuId ? "["+t.kundeEvuId+"] " : ""}${t.titel||"(ohne Titel)"}`);
+    const rank = (s)=> s===OVERALL.eskalation ? 0 : s===OVERALL.wartend ? 1 : s===OVERALL.angenommen ? 2 : s===OVERALL.offen ? 3 : 4;
+    const sortTasks = (arr)=>arr.sort((a,b)=>{
+      const r = rank(a.statusGesamt) - rank(b.statusGesamt);
+      if(r) return r;
+      return new Date(b.updatedAt||b.createdAt) - new Date(a.updatedAt||a.createdAt);
     });
+    const lineForTask = (t)=>`• ${t.internalVorgangId ? t.internalVorgangId + " · " : ""}${t.kundeEvuId ? "["+t.kundeEvuId+"] " : ""}${t.titel || "(ohne Titel)"}`;
+    const addSection = (lines, title, arr, emptyText)=>{
+      lines.push(title);
+      if(!arr.length) lines.push(`• ${emptyText}`);
+      else arr.slice(0,10).forEach(t=>lines.push(lineForTask(t)));
+      lines.push("");
+    };
 
-  lines.push("");
-  lines.push("Aktuell im Dienst:");
+    const offene = sortTasks(all.filter(t => !t.done && !t.archived && t.statusGesamt === OVERALL.offen));
+    const bearbeitet = sortTasks(all.filter(t => !t.done && !t.archived && t.statusGesamt !== OVERALL.offen));
+    const abgeschlossen = sortTasks(all.filter(t => !!t.done && !t.archived));
 
-  const now = new Date();
-
-  PLAN.filter(p => p.start <= now && p.end >= now)
-    .forEach(p=>{
-      const t1 = p.start.toLocaleTimeString("de-CH",{hour:"2-digit",minute:"2-digit"});
-      const t2 = p.end.toLocaleTimeString("de-CH",{hour:"2-digit",minute:"2-digit"});
-
-      lines.push(`• ${p.name} (${t1}–${t2}) ${p.ort}${displayAuftrag(p) ? " · " + displayAuftrag(p) : ""}`);
-    });
-
-  lines.push("");
-  lines.push("Dienständerungen / Notizen:");
-
-  PLAN.forEach(p=>{
-    const ui = STAFF_UI[staffKey(p)];
-    if(!ui) return;
-    if(ui.note) lines.push(`• ${p.name}: ${ui.note}`);
-    if(ui.change) lines.push(`• ${p.name}: Dienständerung – ${ui.change}`);
-  });
-
-  return lines.join("\n");
-}
+    const lines = [];
+    addSection(lines, "Vorgänge offen:", offene, "keine offenen Vorgänge");
+    addSection(lines, "Vorgänge bearbeitet / in Abklärung:", bearbeitet, "keine Vorgänge in Bearbeitung");
+    addSection(lines, "Vorgänge abgeschlossen:", abgeschlossen, "keine abgeschlossenen Vorgänge");
+    return lines.join("
+").trim();
+  }
 
   function buildCloudPayload(latestHandover){
     return {
