@@ -941,20 +941,21 @@
   // ===== V7.60 SharePoint / Power Automate =====
   // Hier die beiden HTTP-POST-URLs aus Power Automate eintragen.
   // Wichtig: URLs nicht in öffentliche Repos committen, wenn sie geheim bleiben sollen.
-  // Flow 1: speichert den Schichtwechsel / die Dienstübergabe in der Liste „Dienstübergabe".
   const SAVE_FLOW_URL = "https://defaulte3d2e8defe3548eaa78972c4a2acf9.8e.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/65bc7671fea74239aac0591a56f69d81/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=lFqDM4fusltfTyo-g0czYt8Yhl95IMlQWkim3fK3ZWk";
 
-  // Flow 2: synchronisiert die separaten Aufgaben in der Liste „Dienstübergabe Aufgaben".
-  // Nach dem Import des Aufgaben-Sync-Flows hier dessen HTTP-POST-URL eintragen.
+  // Flow 2: synchronisiert die separaten Aufgaben in der Liste „Aufgaben-Schichtwechsel".
   const SAVE_TASKS_FLOW_URL = "https://defaulte3d2e8defe3548eaa78972c4a2acf9.8e.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/988520e4869c407baae966ddd1aac501/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=9HvwHjit9x6XaBLSElJ_LbyxwTNFC8f9U-clPEbM3h8";
 
-  // Flow 3: lädt den letzten Schichtwechsel / die Dienstübergabe.
+  // Flow 2b: lädt die offenen Aufgaben aus der separaten SharePoint-Aufgabenliste.
+  // Dafür braucht es einen eigenen Lade-Flow oder der bestehende LOAD_FLOW muss taskListItems mitgeben.
+  const LOAD_TASKS_FLOW_URL = "HIER_DEINE_AUFGABEN_LOAD_FLOW_URL";
   const LOAD_FLOW_URL = "https://defaulte3d2e8defe3548eaa78972c4a2acf9.8e.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/6160c1c3992a484f8da2bcd91b6183fe/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=a7Nb6s9h350_P2aVzkXv8T8d-KcIuZyBYxX3vXlkOyA";
   // Optionaler zweiter Flow: liest die SharePoint-Ereignisliste und übernimmt daraus offene/nachträgliche Aufgaben.
   // Ereignisse selbst bleiben extern; nur Aufgaben/Folgepunkte aus der Ereignisliste werden hier als Vorgänge geführt.
   const LOAD_EVENTS_FLOW_URL = "HIER_DEINE_EVENTS_LOAD_FLOW_URL";
   const CLOUD_ENABLED = !SAVE_FLOW_URL.includes("HIER_DEINE") && !LOAD_FLOW_URL.includes("HIER_DEINE");
   const TASKS_FLOW_ENABLED = !!SAVE_TASKS_FLOW_URL && !SAVE_TASKS_FLOW_URL.includes("HIER_DEINE");
+  const TASKS_LOAD_FLOW_ENABLED = !!LOAD_TASKS_FLOW_URL && !LOAD_TASKS_FLOW_URL.includes("HIER_DEINE");
   const EVENTS_FLOW_ENABLED = !!LOAD_EVENTS_FLOW_URL && !LOAD_EVENTS_FLOW_URL.includes("HIER_DEINE");
 
   const TYPEN = [
@@ -3951,25 +3952,6 @@
     if(kind) cloudStatus.classList.add(kind);
   }
 
-  async function fetchJsonWithTimeout(url, options={}, timeoutMs=180000){
-    const controller = new AbortController();
-    const timer = setTimeout(()=>controller.abort(), timeoutMs);
-    try{
-      const response = await fetch(url, {...options, signal: controller.signal});
-      const raw = await response.text();
-      let result = null;
-      if(raw){
-        try{ result = JSON.parse(raw); }
-        catch(_){ result = { success: response.ok, message: raw }; }
-      }else{
-        result = { success: response.ok };
-      }
-      return { response, result, raw };
-    }finally{
-      clearTimeout(timer);
-    }
-  }
-
   async function saveHandoverToSharePoint(entry){
     if(!SAVE_FLOW_URL || SAVE_FLOW_URL.includes("HIER_DEINE")){
       setCloudStatus("Lokal gespeichert. SharePoint-Speichern ist noch nicht konfiguriert: SAVE_FLOW_URL fehlt.", "warn");
@@ -3977,7 +3959,7 @@
     }
 
     const payload = buildCloudPayload(entry);
-    const { response, result } = await fetchJsonWithTimeout(SAVE_FLOW_URL, {
+    const response = await fetch(SAVE_FLOW_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -3986,8 +3968,10 @@
         version: payload.appVersion,
         daten: payload
       })
-    }, 180000);
+    });
 
+    let result = null;
+    try{ result = await response.json(); }catch(_){ result = { success: response.ok }; }
     if(!response.ok || result?.success === false){
       throw new Error(result?.message || `Power Automate Antwort: HTTP ${response.status}`);
     }
@@ -3995,13 +3979,14 @@
     return result;
   }
 
+
   async function saveTasksToSharePoint(entry){
     if(!TASKS_FLOW_ENABLED){
       return { skipped:true, message:"Aufgaben-Sync-Flow noch nicht konfiguriert." };
     }
 
     const payload = buildCloudPayload(entry);
-    const { response, result } = await fetchJsonWithTimeout(SAVE_TASKS_FLOW_URL, {
+    const response = await fetch(SAVE_TASKS_FLOW_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -4010,15 +3995,16 @@
         version: payload.appVersion,
         daten: payload
       })
-    }, 180000);
+    });
 
-    // Der Aufgaben-Flow kann länger laufen oder am Ende eine fehlerhafte Response liefern,
-    // obwohl die SharePoint-Aktionen bereits erfolgreich waren. Darum blockiert ein
-    // HTTP-400/502 die Dienstübergabe nicht mehr. Die Flow-Ausführung bleibt in
-    // Power Automate prüfbar, die Liste wird trotzdem befüllt.
+    let result = null;
+    try{ result = await response.json(); }catch(_){ result = { success: response.ok }; }
+
+    // Der Aufgaben-Flow schreibt teilweise korrekt in SharePoint, antwortet aber zeitweise spät/ungünstig.
+    // Deshalb wird die Dienstübergabe nicht blockiert, wenn der Flow erreicht wurde.
     if(!response.ok || result?.success === false){
       return {
-        warning: true,
+        warning:true,
         status: response.status,
         message: result?.message || `Aufgaben-Sync Antwort: HTTP ${response.status}`
       };
@@ -4123,6 +4109,128 @@
     return { created, updated, closed, total:(items || []).length };
   }
 
+
+  function truthyJaNein(v){
+    const s = String(v ?? "").trim().toLowerCase();
+    return v === true || s === "ja" || s === "true" || s === "1" || s === "yes";
+  }
+
+  function firstDefined(){
+    for(const v of arguments){
+      if(v !== undefined && v !== null && String(v).trim() !== "") return v;
+    }
+    return "";
+  }
+
+  function flattenTaskFlowItems(result){
+    let data = result?.daten ?? result?.items ?? result?.tasks ?? result?.taskListItems ?? result?.activeTaskRows ?? result?.aufgabenListe ?? result?.separateAufgaben ?? result?.value ?? result;
+    if(typeof data === "string"){
+      try{ data = JSON.parse(data); }catch(_){ data = []; }
+    }
+    if(Array.isArray(data)) return data;
+    const direct = data?.taskListItems || data?.activeTaskRows || data?.aufgabenListe || data?.separateAufgaben || data?.tasks || data?.items || data?.value || [];
+    return Array.isArray(direct) ? direct : [];
+  }
+
+  function sharePointTaskRowToTask(item){
+    const id = String(firstDefined(item.LocalID, item.localId, item.field_1, item.ID, item.Id, uid()));
+    const internalId = String(firstDefined(item.VorgangsID, item.vorgangsId, item.internalVorgangId, item.Title, item.title, item.field_0, id));
+    const typ = String(firstDefined(item.Typ, item.typ, item.field_3, "notiz"));
+    const typLabel = String(firstDefined(item.TypLabel, item.typLabel, item.field_4, typ));
+    const titleText = String(firstDefined(item.Titel, item.titel, item.field_2, item.Title, internalId));
+    const done = truthyJaNein(firstDefined(item.Done, item.done, item.field_14));
+    const archived = truthyJaNein(firstDefined(item.Archived, item.archived, item.field_15));
+    const updated = String(firstDefined(item.UpdatedAt, item.updatedAt, item.field_17, item.Modified, nowIso()));
+    const datum = String(firstDefined(item.Datum, item.datum, item.field_7, ""));
+    const dienst = String(firstDefined(item.Dienst, item.dienst, item.field_10, ""));
+    const zug = String(firstDefined(item.Zug, item.zug, item.field_11, ""));
+    const ort = String(firstDefined(item.OrtRelation, item.ort, item.field_12, ""));
+    const mitarbeiterName = String(firstDefined(item.MitarbeiterName, item.mitarbeiterName, item.field_13, ""));
+
+    const task = {
+      id,
+      internalVorgangId: internalId,
+      createdAt: String(firstDefined(item.CreatedAt, item.createdAt, item.Created, updated, nowIso())),
+      updatedAt: updated,
+      shift: String(firstDefined(item.Schicht, item.shift, item.field_6, state.ui?.shift || "Tag")),
+      kundeEvuId: String(firstDefined(item.KundeEVU, item.kundeEvuId, item.field_8, "")),
+      kundeLabel: String(firstDefined(item.KundeLabel, item.kundeLabel, item.field_9, "")),
+      typ,
+      typLabel,
+      titel: titleText,
+      zug,
+      dienst,
+      ort,
+      incidentId: "",
+      notiz: String(firstDefined(item.Bemerkung, item.bemerkung, item.field_20, "")),
+      requests: [],
+      details: {
+        datum,
+        dienst,
+        vonNach: ort,
+        mitarbeiterName,
+        sourceProcess: "sharepoint_aufgabenliste",
+        sharePointItemId: String(firstDefined(item.ID, item.Id, "")),
+        syncedFromTasksListAt: nowIso()
+      },
+      done,
+      archived
+    };
+    task.statusGesamt = String(firstDefined(item.Status, item.status, item.field_5, computeOverallStatus(task)));
+    ensureInternalVorgangId(task);
+    return task;
+  }
+
+  function mergeSharePointTaskRows(items){
+    let created = 0, updated = 0, closed = 0;
+    (items || []).forEach(item=>{
+      const nt = sharePointTaskRowToTask(item);
+      const key = nt.internalVorgangId || nt.id;
+      const existing = (state.tasks || []).find(t => (t.internalVorgangId && t.internalVorgangId === key) || t.id === nt.id);
+      if(existing){
+        existing.titel = nt.titel || existing.titel;
+        existing.kundeEvuId = nt.kundeEvuId || existing.kundeEvuId;
+        existing.kundeLabel = nt.kundeLabel || existing.kundeLabel;
+        existing.typ = nt.typ || existing.typ;
+        existing.typLabel = nt.typLabel || existing.typLabel;
+        existing.zug = nt.zug || existing.zug;
+        existing.dienst = nt.dienst || existing.dienst;
+        existing.ort = nt.ort || existing.ort;
+        existing.statusGesamt = nt.statusGesamt || existing.statusGesamt;
+        existing.details = {...(existing.details || {}), ...(nt.details || {})};
+        existing.done = !!nt.done;
+        existing.archived = !!nt.archived;
+        existing.updatedAt = nt.updatedAt || nowIso();
+        ensureInternalVorgangId(existing);
+        updated++;
+        if(existing.done || existing.archived) closed++;
+      }else if(!nt.done && !nt.archived){
+        state.tasks.unshift(nt);
+        created++;
+      }else{
+        closed++;
+      }
+    });
+    return { created, updated, closed, total:(items || []).length };
+  }
+
+  async function loadTasksFromSharePoint(){
+    if(!TASKS_LOAD_FLOW_ENABLED){
+      return { skipped:true, message:"Aufgaben-Lade-Flow noch nicht konfiguriert." };
+    }
+    const response = await fetch(LOAD_TASKS_FLOW_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ aktion:"loadActiveTasks", quelle:"dienstuebergabe" })
+    });
+    const result = await response.json();
+    if(!response.ok || result?.success === false){
+      throw new Error(result?.message || `Aufgaben-Lade-Flow Antwort: HTTP ${response.status}`);
+    }
+    const items = flattenTaskFlowItems(result);
+    return mergeSharePointTaskRows(items);
+  }
+
   async function loadEventFollowUpsFromSharePoint(){
     if(!EVENTS_FLOW_ENABLED){
       return { skipped:true, message:"Ereignis-Flow noch nicht konfiguriert." };
@@ -4172,6 +4280,13 @@
     remoteState.ui.listFilter = "aktiv";
     remoteState.ui.evu = "__ALL__";
     state = remoteState;
+    let taskInfo = null;
+    try{
+      taskInfo = await loadTasksFromSharePoint();
+    }catch(taskErr){
+      taskInfo = { error: taskErr?.message || String(taskErr) };
+    }
+
     let eventInfo = null;
     try{
       eventInfo = await loadEventFollowUpsFromSharePoint();
@@ -4183,10 +4298,13 @@
     if(handoverNotes) handoverNotes.value = state.handovers?.[0]?.notes || "";
     safeRender();
     let msg = `Letzte Übergabe aus SharePoint geladen${result.gespeichertAm ? ": " + fmtTs(result.gespeichertAm) : ""}.`;
+    if(taskInfo?.error) msg += ` Aufgabenliste konnte nicht geladen werden: ${taskInfo.error}`;
+    else if(taskInfo?.skipped) msg += " Aufgaben-Lade-Flow noch nicht konfiguriert.";
+    else if(taskInfo) msg += ` Aufgabenliste: ${taskInfo.created} neu, ${taskInfo.updated} aktualisiert, ${taskInfo.closed} abgeschlossen/ausgeblendet.`;
     if(eventInfo?.error) msg += ` Ereignisliste konnte nicht geladen werden: ${eventInfo.error}`;
     else if(eventInfo?.skipped) msg += " Ereignis-Flow noch nicht konfiguriert.";
     else if(eventInfo) msg += ` Ereignis-Aufgaben: ${eventInfo.created} neu, ${eventInfo.updated} aktualisiert, ${eventInfo.closed} abgeschlossen.`;
-    setCloudStatus(msg, eventInfo?.error ? "warn" : "ok");
+    setCloudStatus(msg, (eventInfo?.error || taskInfo?.error) ? "warn" : "ok");
   }
 
   btnSaveHandover.addEventListener("click", async ()=>{
@@ -4211,13 +4329,15 @@
       let taskSyncMsg = "Aufgaben-Sync noch nicht konfiguriert.";
       try{
         const taskResult = await saveTasksToSharePoint(entry);
-        taskSyncMsg = taskResult?.skipped ? "Aufgaben-Sync noch nicht konfiguriert." : "Aufgabenliste synchronisiert.";
+        if(taskResult?.skipped) taskSyncMsg = "Aufgaben-Sync noch nicht konfiguriert.";
+        else if(taskResult?.warning) taskSyncMsg = "Aufgaben-Sync angestossen; bitte Aufgabenliste prüfen.";
+        else taskSyncMsg = "Aufgabenliste synchronisiert.";
       }catch(taskErr){
-        taskSyncMsg = "Aufgaben-Sync fehlgeschlagen: " + (taskErr?.message || taskErr);
+        taskSyncMsg = "Aufgaben-Sync angestossen; bitte Aufgabenliste prüfen.";
       }
 
       const baseMsg = SAVE_FLOW_URL.includes("HIER_DEINE") ? "Übergabe lokal gespeichert. SharePoint-URL fehlt noch." : "Übergabe lokal und in SharePoint gespeichert.";
-      setCloudStatus(`${baseMsg} ${taskSyncMsg}`, taskSyncMsg.includes("fehlgeschlagen") ? "warn" : "ok");
+      setCloudStatus(`${baseMsg} ${taskSyncMsg}`, taskSyncMsg.includes("prüfen") ? "warn" : "ok");
       alert(`${baseMsg}\n${taskSyncMsg}`);
     }catch(err){
       setCloudStatus("Lokal gespeichert, aber SharePoint-Speichern fehlgeschlagen: " + (err?.message || err), "err");
