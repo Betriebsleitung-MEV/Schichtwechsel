@@ -941,12 +941,20 @@
   // ===== V7.60 SharePoint / Power Automate =====
   // Hier die beiden HTTP-POST-URLs aus Power Automate eintragen.
   // Wichtig: URLs nicht in öffentliche Repos committen, wenn sie geheim bleiben sollen.
+  // Flow 1: speichert den Schichtwechsel / die Dienstübergabe in der Liste „Dienstübergabe".
   const SAVE_FLOW_URL = "https://defaulte3d2e8defe3548eaa78972c4a2acf9.8e.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/65bc7671fea74239aac0591a56f69d81/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=lFqDM4fusltfTyo-g0czYt8Yhl95IMlQWkim3fK3ZWk";
+
+  // Flow 2: synchronisiert die separaten Aufgaben in der Liste „Dienstübergabe Aufgaben".
+  // Nach dem Import des Aufgaben-Sync-Flows hier dessen HTTP-POST-URL eintragen.
+  const SAVE_TASKS_FLOW_URL = "https://defaulte3d2e8defe3548eaa78972c4a2acf9.8e.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/988520e4869c407baae966ddd1aac501/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=9HvwHjit9x6XaBLSElJ_LbyxwTNFC8f9U-clPEbM3h8";
+
+  // Flow 3: lädt den letzten Schichtwechsel / die Dienstübergabe.
   const LOAD_FLOW_URL = "https://defaulte3d2e8defe3548eaa78972c4a2acf9.8e.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/6160c1c3992a484f8da2bcd91b6183fe/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=a7Nb6s9h350_P2aVzkXv8T8d-KcIuZyBYxX3vXlkOyA";
   // Optionaler zweiter Flow: liest die SharePoint-Ereignisliste und übernimmt daraus offene/nachträgliche Aufgaben.
   // Ereignisse selbst bleiben extern; nur Aufgaben/Folgepunkte aus der Ereignisliste werden hier als Vorgänge geführt.
   const LOAD_EVENTS_FLOW_URL = "HIER_DEINE_EVENTS_LOAD_FLOW_URL";
   const CLOUD_ENABLED = !SAVE_FLOW_URL.includes("HIER_DEINE") && !LOAD_FLOW_URL.includes("HIER_DEINE");
+  const TASKS_FLOW_ENABLED = !!SAVE_TASKS_FLOW_URL && !SAVE_TASKS_FLOW_URL.includes("HIER_DEINE");
   const EVENTS_FLOW_ENABLED = !!LOAD_EVENTS_FLOW_URL && !LOAD_EVENTS_FLOW_URL.includes("HIER_DEINE");
 
   const TYPEN = [
@@ -3970,6 +3978,31 @@
     return result;
   }
 
+  async function saveTasksToSharePoint(entry){
+    if(!TASKS_FLOW_ENABLED){
+      return { skipped:true, message:"Aufgaben-Sync-Flow noch nicht konfiguriert." };
+    }
+
+    const payload = buildCloudPayload(entry);
+    const response = await fetch(SAVE_TASKS_FLOW_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        aktion: "syncTasks",
+        gespeichertVon: payload.savedBy || "Dienstübergabe",
+        version: payload.appVersion,
+        daten: payload
+      })
+    });
+
+    let result = null;
+    try{ result = await response.json(); }catch(_){ result = { success: response.ok }; }
+    if(!response.ok || result?.success === false){
+      throw new Error(result?.message || `Aufgaben-Sync Antwort: HTTP ${response.status}`);
+    }
+    return result;
+  }
+
   function eventItemClosed(item){
     const raw = String(item?.status || item?.Status || item?.state || item?.abschlussStatus || item?.AbschlussStatus || "").toLowerCase();
     return !!(item?.abgeschlossen || item?.closed || item?.done || raw.includes("abgeschlossen") || raw.includes("erledigt") || raw.includes("closed"));
@@ -4152,7 +4185,17 @@
 
     try{
       await saveHandoverToSharePoint(entry);
-      alert(SAVE_FLOW_URL.includes("HIER_DEINE") ? "Übergabe lokal gespeichert. SharePoint-URL fehlt noch." : "Übergabe lokal und in SharePoint gespeichert.");
+      let taskSyncMsg = "Aufgaben-Sync noch nicht konfiguriert.";
+      try{
+        const taskResult = await saveTasksToSharePoint(entry);
+        taskSyncMsg = taskResult?.skipped ? "Aufgaben-Sync noch nicht konfiguriert." : "Aufgabenliste synchronisiert.";
+      }catch(taskErr){
+        taskSyncMsg = "Aufgaben-Sync fehlgeschlagen: " + (taskErr?.message || taskErr);
+      }
+
+      const baseMsg = SAVE_FLOW_URL.includes("HIER_DEINE") ? "Übergabe lokal gespeichert. SharePoint-URL fehlt noch." : "Übergabe lokal und in SharePoint gespeichert.";
+      setCloudStatus(`${baseMsg} ${taskSyncMsg}`, taskSyncMsg.includes("fehlgeschlagen") ? "warn" : "ok");
+      alert(`${baseMsg}\n${taskSyncMsg}`);
     }catch(err){
       setCloudStatus("Lokal gespeichert, aber SharePoint-Speichern fehlgeschlagen: " + (err?.message || err), "err");
       alert("Übergabe lokal gespeichert, aber SharePoint-Speichern fehlgeschlagen: " + (err?.message || err));
