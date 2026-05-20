@@ -6906,8 +6906,29 @@ buildTaskActionsHtml = function(t, status){
 };
 
 // Verlauf für Dienständerung zeigt angebundene Ersatzplanung; Ersatzplanung zeigt eigene Schritte.
-const v761OldRenderTimelineForTask = renderTimelineForTaskV39;
-renderTimelineForTaskV39 = function(t){
+// Fallbacks nötig, weil ältere V7.39-Hilfsfunktionen je nach Build nicht global verfügbar sind.
+function v761Esc(s){
+  return String(s ?? "")
+    .replaceAll("&","&amp;")
+    .replaceAll("<","&lt;")
+    .replaceAll(">","&gt;")
+    .replaceAll('"',"&quot;")
+    .replaceAll("'","&#039;");
+}
+function v761TimelineClass(state){
+  if(state === "done") return "done";
+  if(state === "problem") return "problem";
+  if(state === "wait") return "wait";
+  return "";
+}
+function v761RenderTimelineFallback(steps){
+  return `<div class="taskTimeline">${(steps||[]).map((s,i)=>`<div class="tlStep ${v761TimelineClass(s.state)}"><span class="tlDot"></span><span class="tlLabel">${v761Esc(s.label)}</span></div>${i<(steps||[]).length-1?'<div class="tlLine"></div>':''}`).join("")}</div>`;
+}
+const v761TimelineRenderer = (typeof renderTimelineV39 === "function") ? renderTimelineV39 : v761RenderTimelineFallback;
+const v761OldRenderTimelineForTask = (typeof renderTimelineForTaskV39 === "function")
+  ? renderTimelineForTaskV39
+  : ((typeof renderTaskTimeline === "function") ? renderTaskTimeline : null);
+var renderTimelineForTaskV39 = function(t){
   const typ = t?.typ || "";
   const d = t?.details || {};
   const abgeschlossen = (t.done || t.archived) ? "done" : "";
@@ -6915,7 +6936,7 @@ renderTimelineForTaskV39 = function(t){
   if(v761IsReplacementTask(t)){
     const hasReq = (t.requests || []).length > 0;
     const confirmed = (t.requests || []).some(r => r.status === REQ_STATUS.bestaetigt);
-    return renderTimelineV39([
+    return v761TimelineRenderer([
       {label:"Ersatzbedarf", state:"done"},
       {label:"Ersatz-MA wählen", state: hasReq ? "done" : "wait"},
       {label:"Rückmeldung", state: confirmed ? "done" : (hasReq ? "wait" : "")},
@@ -6925,7 +6946,7 @@ renderTimelineForTaskV39 = function(t){
 
   if(typ === "dienstaenderung"){
     const repl = v761FindReplacementForChange(t);
-    return renderTimelineV39([
+    return v761TimelineRenderer([
       {label:"Fall aufgenommen", state:"done"},
       {label:"Ersatzplanung", state: repl ? (repl.done ? "done" : "wait") : (d.changeReplacement === "nein" ? "done" : "")},
       {label:"Antwortmail", state: d.changeMailPrepared ? "done" : ""},
@@ -6934,9 +6955,9 @@ renderTimelineForTaskV39 = function(t){
     ]);
   }
 
-  return v761OldRenderTimelineForTask ? v761OldRenderTimelineForTask(t) : renderTaskTimeline(t);
+  return v761OldRenderTimelineForTask ? v761OldRenderTimelineForTask(t) : v761TimelineRenderer([{label:"Erfasst", state:"done"},{label:"In Abklärung", state:(t && !t.done && !t.archived) ? "wait" : "done"},{label:"Abschluss", state:(t && (t.done || t.archived)) ? "done" : ""}]);
 };
-try{ renderTaskTimeline = renderTimelineForTaskV39; window.renderTaskTimeline = renderTimelineForTaskV39; }catch(_){ }
+try{ window.renderTimelineForTaskV39 = renderTimelineForTaskV39; renderTaskTimeline = renderTimelineForTaskV39; window.renderTaskTimeline = renderTimelineForTaskV39; }catch(_){ }
 
 // Beim Öffnen einer verknüpften Ersatzplanung die Maske passend beschriften.
 const v761OldOpenTaskModal = openTaskModal;
