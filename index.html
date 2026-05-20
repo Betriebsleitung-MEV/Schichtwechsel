@@ -3951,6 +3951,25 @@
     if(kind) cloudStatus.classList.add(kind);
   }
 
+  async function fetchJsonWithTimeout(url, options={}, timeoutMs=180000){
+    const controller = new AbortController();
+    const timer = setTimeout(()=>controller.abort(), timeoutMs);
+    try{
+      const response = await fetch(url, {...options, signal: controller.signal});
+      const raw = await response.text();
+      let result = null;
+      if(raw){
+        try{ result = JSON.parse(raw); }
+        catch(_){ result = { success: response.ok, message: raw }; }
+      }else{
+        result = { success: response.ok };
+      }
+      return { response, result, raw };
+    }finally{
+      clearTimeout(timer);
+    }
+  }
+
   async function saveHandoverToSharePoint(entry){
     if(!SAVE_FLOW_URL || SAVE_FLOW_URL.includes("HIER_DEINE")){
       setCloudStatus("Lokal gespeichert. SharePoint-Speichern ist noch nicht konfiguriert: SAVE_FLOW_URL fehlt.", "warn");
@@ -3958,7 +3977,7 @@
     }
 
     const payload = buildCloudPayload(entry);
-    const response = await fetch(SAVE_FLOW_URL, {
+    const { response, result } = await fetchJsonWithTimeout(SAVE_FLOW_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -3967,10 +3986,8 @@
         version: payload.appVersion,
         daten: payload
       })
-    });
+    }, 180000);
 
-    let result = null;
-    try{ result = await response.json(); }catch(_){ result = { success: response.ok }; }
     if(!response.ok || result?.success === false){
       throw new Error(result?.message || `Power Automate Antwort: HTTP ${response.status}`);
     }
@@ -3984,7 +4001,7 @@
     }
 
     const payload = buildCloudPayload(entry);
-    const response = await fetch(SAVE_TASKS_FLOW_URL, {
+    const { response, result } = await fetchJsonWithTimeout(SAVE_TASKS_FLOW_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -3993,14 +4010,20 @@
         version: payload.appVersion,
         daten: payload
       })
-    });
+    }, 180000);
 
-    let result = null;
-    try{ result = await response.json(); }catch(_){ result = { success: response.ok }; }
+    // Der Aufgaben-Flow kann länger laufen oder am Ende eine fehlerhafte Response liefern,
+    // obwohl die SharePoint-Aktionen bereits erfolgreich waren. Darum blockiert ein
+    // HTTP-400/502 die Dienstübergabe nicht mehr. Die Flow-Ausführung bleibt in
+    // Power Automate prüfbar, die Liste wird trotzdem befüllt.
     if(!response.ok || result?.success === false){
-      throw new Error(result?.message || `Aufgaben-Sync Antwort: HTTP ${response.status}`);
+      return {
+        warning: true,
+        status: response.status,
+        message: result?.message || `Aufgaben-Sync Antwort: HTTP ${response.status}`
+      };
     }
-    return result;
+    return result || { success:true };
   }
 
   function eventItemClosed(item){
