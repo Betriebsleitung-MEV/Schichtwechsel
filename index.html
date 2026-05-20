@@ -6854,8 +6854,17 @@ v724TaskTypeGroup = function(t){
   return "90|Sonstige Vorgänge";
 };
 
-const v761OldTaskGroupClass = v724TaskGroupClass;
+const v761OldTaskGroupClass = (typeof v724TaskGroupClass === "function")
+  ? v724TaskGroupClass
+  : function(label){
+      label = String(label || "");
+      if(label.includes("HAZ")) return "haz";
+      if(label.includes("Ereign")) return "event";
+      if(label.includes("Krank")) return "krank";
+      return "";
+    };
 v724TaskGroupClass = function(label){
+  label = String(label || "");
   if(label.includes("Ersatzplanung")) return "";
   return v761OldTaskGroupClass ? v761OldTaskGroupClass(label) : "";
 };
