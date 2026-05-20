@@ -943,7 +943,6 @@
   // Wichtig: URLs nicht in öffentliche Repos committen, wenn sie geheim bleiben sollen.
   const SAVE_FLOW_URL = "https://defaulte3d2e8defe3548eaa78972c4a2acf9.8e.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/65bc7671fea74239aac0591a56f69d81/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=lFqDM4fusltfTyo-g0czYt8Yhl95IMlQWkim3fK3ZWk";
   const LOAD_FLOW_URL = "https://defaulte3d2e8defe3548eaa78972c4a2acf9.8e.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/6160c1c3992a484f8da2bcd91b6183fe/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=a7Nb6s9h350_P2aVzkXv8T8d-KcIuZyBYxX3vXlkOyA";
-
   // Aufgaben-Flow: derselbe Flow kann speichern (aktion: saveTasks) und laden (aktion: loadTasks).
   const SAVE_TASKS_FLOW_URL = "https://defaulte3d2e8defe3548eaa78972c4a2acf9.8e.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/988520e4869c407baae966ddd1aac501/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=9HvwHjit9x6XaBLSElJ_LbyxwTNFC8f9U-clPEbM3h8";
   const LOAD_TASKS_FLOW_URL = SAVE_TASKS_FLOW_URL;
@@ -3935,30 +3934,11 @@
       role: roleSel?.value || "Dispo",
       shift: state.ui?.shift || "Früh",
       latestHandover: latestHandover || null,
+      // Die Dienstübergabe-Liste speichert nur den Rapport/Schichtstand.
+      // Offene Vorgänge werden separat über die Aufgabenliste synchronisiert.
       sharePointListTasks: sharePointListTasks(),
       allVorgangData: exportAllVorgangData(),
-      state: state
-    };
-  }
-
-  function buildHandoverCloudPayload(latestHandover){
-    const handoverState = {
-      tasks: [],
-      handovers: Array.isArray(state.handovers) ? state.handovers : [],
-      ui: state.ui || { shift:"Früh", evu:"__ALL__", listFilter:"aktiv" }
-    };
-    return {
-      appVersion: "7.60",
-      savedAt: nowIso(),
-      savedBy: operatorDisplayText() || (roleSel?.value || ""),
-      role: roleSel?.value || "Dispo",
-      shift: state.ui?.shift || "Früh",
-      latestHandover: latestHandover || null,
-      taskStats: {
-        open: (state.tasks || []).filter(t=>!t.done && !t.archived).length,
-        done: (state.tasks || []).filter(t=>!!t.done && !t.archived).length
-      },
-      state: handoverState
+      state: { tasks: [], handovers: state.handovers || [], ui: state.ui || {} }
     };
   }
 
@@ -3975,7 +3955,7 @@
       return { skipped:true };
     }
 
-    const payload = buildHandoverCloudPayload(entry);
+    const payload = buildCloudPayload(entry);
     const response = await fetch(SAVE_FLOW_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -3996,79 +3976,128 @@
     return result;
   }
 
-  function flattenTasksFlowItems(result){
-    let data = result?.taskListItems ?? result?.activeTaskRows ?? result?.aufgabenListe ?? result?.separateAufgaben ?? result?.items ?? result?.value ?? result?.daten ?? result;
-    if(typeof data === "string"){
-      try{ data = JSON.parse(data); }catch(_){ data = []; }
+  async function saveTasksToSharePoint(entry){
+    if(!TASKS_FLOW_ENABLED){
+      return { skipped:true, message:"Aufgaben-Sync-Flow noch nicht konfiguriert." };
     }
-    if(Array.isArray(data)) return data;
-    const direct = data?.taskListItems || data?.activeTaskRows || data?.aufgabenListe || data?.separateAufgaben || data?.items || data?.value || data?.tasks || [];
-    return Array.isArray(direct) ? direct : [];
+    const payload = buildCloudPayload(entry);
+    const response = await fetch(SAVE_TASKS_FLOW_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        aktion: "saveTasks",
+        gespeichertVon: payload.savedBy || "Dienstübergabe",
+        version: payload.appVersion,
+        daten: payload
+      })
+    });
+    let result = null;
+    try{ result = await response.json(); }catch(_){ result = { success: response.ok }; }
+    if(!response.ok || result?.success === false){
+      throw new Error(result?.message || `Aufgaben-Sync Antwort: HTTP ${response.status}`);
+    }
+    return result;
   }
 
-  function choiceValue(v){
-    if(v && typeof v === "object") return String(v.Value ?? v.value ?? v.Label ?? v.label ?? "");
-    return String(v ?? "");
+  function parseMaybeJson(value, fallback){
+    if(typeof value !== "string") return value ?? fallback;
+    try{ return JSON.parse(value); }catch(_){ return fallback; }
+  }
+
+  function flattenTaskFlowItems(result){
+    let data = result?.taskListItems ?? result?.activeTaskRows ?? result?.aufgabenListe ?? result?.separateAufgaben ?? result?.tasks ?? result?.items ?? result?.value ?? result?.daten ?? result;
+    data = parseMaybeJson(data, data);
+    if(Array.isArray(data)) return data;
+    if(typeof data === "object" && data){
+      const nested = data.taskListItems ?? data.activeTaskRows ?? data.aufgabenListe ?? data.separateAufgaben ?? data.tasks ?? data.items ?? data.value;
+      const parsedNested = parseMaybeJson(nested, nested);
+      if(Array.isArray(parsedNested)) return parsedNested;
+    }
+    return [];
+  }
+
+  function spText(row, ...keys){
+    for(const k of keys){
+      const v = row?.[k];
+      if(v !== undefined && v !== null && String(v).trim() !== "") return String(v);
+    }
+    return "";
+  }
+
+  function spChoiceText(row, ...keys){
+    for(const k of keys){
+      const v = row?.[k];
+      if(v && typeof v === "object" && "Value" in v) return String(v.Value || "");
+      if(v !== undefined && v !== null && String(v).trim() !== "") return String(v);
+    }
+    return "";
+  }
+
+  function spYesNo(row, ...keys){
+    const v = spChoiceText(row, ...keys).toLowerCase();
+    return v === "ja" || v === "yes" || v === "true" || v === "1";
   }
 
   function sharePointTaskRowToTask(row){
-    const internalId = String(row?.Title || row?.VorgangsID || row?.internalVorgangId || "").trim();
-    const localId = String(row?.field_1 || row?.LocalID || row?.localId || internalId || uid()).trim();
-    const typ = String(row?.field_3 || row?.Typ || row?.typ || "notiz").trim() || "notiz";
-    const typLabel = String(row?.field_4 || row?.TypLabel || row?.typLabel || typ).trim();
-    const status = String(row?.field_5 || row?.Status || row?.status || "offen").trim() || "offen";
-    const datum = String(row?.field_7 || row?.Datum || row?.datum || "").slice(0,10);
-    const dienst = String(row?.field_10 || row?.Dienst || row?.dienst || "").trim();
-    const ort = String(row?.field_12 || row?.OrtRelation || row?.ort || "").trim();
-    const mitarbeiterName = String(row?.field_13 || row?.MitarbeiterName || row?.mitarbeiterName || "").trim();
-    const doneVal = choiceValue(row?.field_14 || row?.Done || row?.done).toLowerCase();
-    const archivedVal = choiceValue(row?.field_15 || row?.Archived || row?.archived).toLowerCase();
-    const done = doneVal === "ja" || doneVal === "true" || doneVal === "1" || status === "erledigt";
-    const archived = archivedVal === "ja" || archivedVal === "true" || archivedVal === "1";
-    const updated = row?.field_17 || row?.UpdatedAt || row?.updatedAt || nowIso();
-    const created = row?.Created || row?.createdAt || updated || nowIso();
-    const task = {
-      id: localId || internalId || uid(),
-      internalVorgangId: internalId || makeInternalVorgangId({typ, id:localId, createdAt:created}),
-      createdAt: created,
-      updatedAt: updated,
-      shift: String(row?.field_6 || row?.Schicht || row?.shift || state.ui?.shift || "Früh"),
-      kundeEvuId: String(row?.field_8 || row?.KundeEVU || row?.kundeEvuId || ""),
-      kundeLabel: String(row?.field_9 || row?.KundeLabel || row?.kundeLabel || ""),
+    const internalId = spText(row, "Title", "VorgangsID", "VorgangsId", "internalVorgangId") || `SP-${spText(row,"Id","ID") || uid()}`;
+    const localId = spText(row, "field_1", "LocalID", "localId") || `SP_${internalId.replace(/[^a-zA-Z0-9_-]/g,"_")}`;
+    const typ = spText(row, "field_3", "Typ", "typ") || "notiz";
+    const typLabel = spText(row, "field_4", "TypLabel", "typLabel") || typ;
+    const title = spText(row, "field_2", "Titel", "titel") || internalId;
+    const status = spChoiceText(row, "field_5", "Status", "status") || "offen";
+    const shift = spChoiceText(row, "field_6", "Schicht", "shift") || state.ui?.shift || "Tag";
+    const datum = spText(row, "field_7", "Datum", "datum");
+    const dienst = spText(row, "field_10", "Dienst", "dienst");
+    const ort = spText(row, "field_12", "OrtRelation", "ort", "Ort");
+    const mitarbeiterName = spText(row, "field_13", "MitarbeiterName", "mitarbeiterName");
+    const kundeEvuId = spText(row, "field_8", "KundeEVU", "kundeEvuId");
+    const kundeLabel = spText(row, "field_9", "KundeLabel", "kundeLabel") || kundeEvuId;
+    const updatedAt = spText(row, "field_17", "UpdatedAt", "updatedAt", "Modified") || nowIso();
+    const done = spYesNo(row, "field_14", "Done", "done") || status.toLowerCase() === "erledigt";
+    const archived = spYesNo(row, "field_15", "Archived", "archived");
+    return {
+      id: localId,
+      internalVorgangId: internalId,
+      createdAt: spText(row, "Created", "createdAt") || updatedAt || nowIso(),
+      updatedAt,
+      shift,
+      kundeEvuId,
+      kundeLabel,
       typ,
       typLabel,
-      titel: String(row?.field_2 || row?.Titel || row?.titel || internalId || "Ohne Titel"),
-      zug: String(row?.field_11 || row?.Zug || row?.zug || ""),
+      titel: title,
+      zug: spText(row, "field_11", "Zug", "zug") || dienst,
       dienst,
       ort,
       incidentId: "",
       notiz: "",
       requests: [],
-      details: {
-        datum,
-        dienst,
-        vonNach: ort,
-        mitarbeiterName,
-        sharePointItemId: row?.Id || row?.ID || "",
-        loadedFromTasksList: true
-      },
+      details: { datum, dienst, vonNach: ort, mitarbeiterName, source:"sharepoint_aufgabenliste", sharePointItemId: spText(row,"Id","ID") },
       done,
       archived
     };
-    return task;
   }
 
-  function mergeSharePointTasks(items){
-    const incoming = (items || []).map(sharePointTaskRowToTask).filter(t=>t.internalVorgangId || t.id);
-    const keep = (state.tasks || []).filter(t => isExternalEventTask(t) || t.typ === "ereignis_aufgabe");
+  function mergeSharePointTaskRows(rows){
+    const incoming = (rows || []).map(sharePointTaskRowToTask).filter(Boolean);
+    const incomingKeys = new Set(incoming.map(t => t.internalVorgangId || t.id));
+    const keep = (state.tasks || []).filter(t => {
+      if(isExternalEventTask(t)) return true;
+      if(t.done || t.archived) return true;
+      const key = t.internalVorgangId || t.id;
+      // Aktive lokale Aufgaben werden durch die SharePoint-Aufgabenliste ersetzt.
+      return !incomingKeys.has(key) && false;
+    });
     state.tasks = incoming.concat(keep);
-    safeNormalizeTasks();
-    return { total: incoming.length, created: incoming.length, updated:0, closed:0 };
+    state.ui ||= { shift:"Früh", evu:"__ALL__", listFilter:"aktiv" };
+    state.ui.listFilter = "aktiv";
+    state.ui.evu = "__ALL__";
+    return { rows: rows?.length || 0, open: incoming.filter(t=>!t.done && !t.archived).length };
   }
 
   async function loadTasksFromSharePoint(){
     if(!TASKS_FLOW_ENABLED){
-      return { skipped:true, message:"Aufgaben-Flow noch nicht konfiguriert." };
+      return { skipped:true, message:"Aufgaben-Lade-Flow noch nicht konfiguriert." };
     }
     const response = await fetch(LOAD_TASKS_FLOW_URL, {
       method: "POST",
@@ -4076,12 +4105,12 @@
       body: JSON.stringify({ aktion:"loadTasks", quelle:"dienstuebergabe" })
     });
     let result = null;
-    try{ result = await response.json(); }catch(_){ result = { success: response.ok, value: [] }; }
+    try{ result = await response.json(); }catch(_){ result = { success: response.ok, taskListItems: [] }; }
     if(!response.ok || result?.success === false){
-      throw new Error(result?.message || `Aufgaben-Flow Antwort: HTTP ${response.status}`);
+      throw new Error(result?.message || `Aufgaben-Lade-Flow Antwort: HTTP ${response.status}`);
     }
-    const items = flattenTasksFlowItems(result);
-    return mergeSharePointTasks(items);
+    const rows = flattenTaskFlowItems(result);
+    return mergeSharePointTaskRows(rows);
   }
 
   function eventItemClosed(item){
@@ -4204,7 +4233,7 @@
       setCloudStatus("SharePoint-Laden ist noch nicht konfiguriert: LOAD_FLOW_URL fehlt.", "warn");
       return;
     }
-    if(!confirm("Letzte Übergabe aus SharePoint laden? Der lokale Stand in diesem Browser wird dadurch ersetzt.")) return;
+    if(!confirm("Letzte Übergabe aus SharePoint laden und offene Aufgaben aus der Aufgabenliste aktualisieren?")) return;
 
     setCloudStatus("Lade letzte Übergabe aus SharePoint …", "warn");
     const response = await fetch(LOAD_FLOW_URL, {
@@ -4220,17 +4249,17 @@
 
     let daten = result.daten;
     if(typeof daten === "string") daten = JSON.parse(daten);
-    const remoteState = daten?.state || daten;
+    const remoteState = daten?.state || daten || {};
 
-    if(!remoteState || !Array.isArray(remoteState.handovers)){
-      throw new Error("Die geladene SharePoint-Antwort enthält keinen gültigen Dienstübergabe-Stand.");
-    }
-
-    remoteState.ui ||= state.ui || { shift:"Früh", evu:"__ALL__", listFilter:"aktiv" };
-    remoteState.ui.listFilter = "aktiv";
-    remoteState.ui.evu = "__ALL__";
-    remoteState.tasks = [];
-    state = remoteState;
+    const oldUi = state.ui || { shift:"Früh", evu:"__ALL__", listFilter:"aktiv" };
+    const oldDoneArchived = (state.tasks || []).filter(t => t.done || t.archived || isExternalEventTask(t));
+    state = {
+      tasks: oldDoneArchived,
+      handovers: Array.isArray(remoteState.handovers) ? remoteState.handovers : (Array.isArray(state.handovers) ? state.handovers : []),
+      ui: remoteState.ui || oldUi
+    };
+    state.ui.listFilter = "aktiv";
+    state.ui.evu = "__ALL__";
 
     let taskInfo = null;
     try{
@@ -4245,18 +4274,20 @@
     }catch(evErr){
       eventInfo = { error: evErr?.message || String(evErr) };
     }
+
     saveState();
     if(handoverSummary) handoverSummary.value = state.handovers?.[0]?.summary || "";
     if(handoverNotes) handoverNotes.value = state.handovers?.[0]?.notes || "";
     safeRender();
+
     let msg = `Letzte Übergabe aus SharePoint geladen${result.gespeichertAm ? ": " + fmtTs(result.gespeichertAm) : ""}.`;
-    if(taskInfo?.error) msg += ` Aufgabenliste konnte nicht geladen werden: ${taskInfo.error}`;
-    else if(taskInfo?.skipped) msg += " Aufgaben-Flow noch nicht konfiguriert.";
-    else if(taskInfo) msg += ` Aufgaben aktualisiert: ${taskInfo.total} offen.`;
+    if(taskInfo?.error) msg += ` Aufgaben konnten nicht geladen werden: ${taskInfo.error}`;
+    else if(taskInfo?.skipped) msg += " Aufgaben-Lade-Flow noch nicht konfiguriert.";
+    else if(taskInfo) msg += ` Aufgaben aktualisiert: ${taskInfo.open} offen.`;
     if(eventInfo?.error) msg += ` Ereignisliste konnte nicht geladen werden: ${eventInfo.error}`;
     else if(eventInfo?.skipped) msg += " Ereignis-Flow noch nicht konfiguriert.";
     else if(eventInfo) msg += ` Ereignis-Aufgaben: ${eventInfo.created} neu, ${eventInfo.updated} aktualisiert, ${eventInfo.closed} abgeschlossen.`;
-    setCloudStatus(msg, (eventInfo?.error || taskInfo?.error) ? "warn" : "ok");
+    setCloudStatus(msg, (taskInfo?.error || eventInfo?.error) ? "warn" : "ok");
   }
 
   btnSaveHandover.addEventListener("click", async ()=>{
@@ -4276,21 +4307,28 @@
     saveState();
     renderHandovers();
 
+    let handoverOk = false;
+    let taskMsg = "";
     try{
       await saveHandoverToSharePoint(entry);
-      let taskMsg = "";
-      try{
-        const taskResult = await saveTasksToSharePoint(entry);
-        if(taskResult?.skipped) taskMsg = " Aufgaben-Sync noch nicht konfiguriert.";
-        else taskMsg = " Aufgabenliste synchronisiert.";
-      }catch(taskErr){
-        taskMsg = " Aufgaben-Sync angestossen/fehlgeschlagen: " + (taskErr?.message || taskErr);
-      }
-      alert((SAVE_FLOW_URL.includes("HIER_DEINE") ? "Übergabe lokal gespeichert. SharePoint-URL fehlt noch." : "Übergabe lokal und in SharePoint gespeichert.") + taskMsg);
+      handoverOk = true;
     }catch(err){
       setCloudStatus("Lokal gespeichert, aber SharePoint-Speichern fehlgeschlagen: " + (err?.message || err), "err");
       alert("Übergabe lokal gespeichert, aber SharePoint-Speichern fehlgeschlagen: " + (err?.message || err));
+      return;
     }
+
+    try{
+      const taskResult = await saveTasksToSharePoint(entry);
+      if(taskResult?.skipped) taskMsg = " Aufgaben-Sync nicht konfiguriert.";
+      else taskMsg = " Aufgaben-Sync abgeschlossen.";
+    }catch(taskErr){
+      taskMsg = " Aufgaben-Sync angestossen/fehlgeschlagen: " + (taskErr?.message || taskErr);
+    }
+
+    const msg = (SAVE_FLOW_URL.includes("HIER_DEINE") ? "Übergabe lokal gespeichert." : "Übergabe lokal und in SharePoint gespeichert.") + taskMsg;
+    setCloudStatus(msg, taskMsg.includes("fehlgeschlagen") ? "warn" : "ok");
+    alert(msg);
   });
 
   btnLoadLatestCloud?.addEventListener("click", ()=>loadLatestFromSharePoint().catch(err=>{
